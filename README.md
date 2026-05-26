@@ -60,7 +60,7 @@ Optional per-file metadata can be added with a sidecar JSON file such as `manual
 
 - An **offline-only pill** at the top right: green when Ollama is reachable on `127.0.0.1:11434`, red otherwise. The chat input is disabled while it's red.
 - **Per-file progress bars** during indexing — `Extract → Chunk → Embed → Store` — with a running mm:ss timer and a final `chunks/s` rate. PDF extraction now runs page-parallel; embedding runs in batches of 16 so the bar moves every couple of seconds instead of waiting for the whole document.
-- A silent **query repair** step for common beamline acronym typos, such as `ivw` -> `IVU`, before semantic search.
+- A silent **query repair** step for common beamline acronym spacing/typos while preserving distinct acronyms like `IVU` and `IVW`.
 - A collapsible **retrieval trace** under every assistant answer showing the top-k hits, their lane, distance, and a preview, plus the retrieval latency.
 
 ## Model Roles

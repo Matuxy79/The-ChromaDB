@@ -3,15 +3,31 @@ from typing import Any, Dict, List, Tuple
 
 
 TYPO_REPLACEMENTS: List[Tuple[re.Pattern[str], str, str]] = [
-    (re.compile(r"\bivw\b", re.IGNORECASE), "IVU", "Corrected IVW to IVU."),
-    (re.compile(r"\bi\s*v\s*w\b", re.IGNORECASE), "IVU", "Corrected IVW to IVU."),
+    (re.compile(r"\bi[\s-]+v[\s-]+u\b", re.IGNORECASE), "IVU", "Normalized spaced IVU acronym."),
+    (re.compile(r"\bi[\s-]+v[\s-]+w\b", re.IGNORECASE), "IVW", "Normalized spaced IVW acronym."),
     (re.compile(r"\bbxd\b", re.IGNORECASE), "BXDS", "Corrected BXD to BXDS."),
 ]
 
-QUERY_EXPANSIONS = {
-    "ivu": "IVU beamline BXDS in-vacuum undulator optical components overview",
-    "bxds": "BXDS IVU beamline in-vacuum undulator optical components overview",
-}
+QUERY_EXPANSIONS: List[Tuple[re.Pattern[str], str]] = [
+    (
+        re.compile(r"\bivu\b", re.IGNORECASE),
+        "IVU beamline BXDS in-vacuum undulator optical components overview",
+    ),
+    (
+        re.compile(r"\bivw\b", re.IGNORECASE),
+        "IVW wiggler beamline low energy wiggler LEW high energy wiggler HEW "
+        "power diffraction SAXS grazing incidence diffraction pair distribution "
+        "function extreme conditions",
+    ),
+    (
+        re.compile(r"\bbxds\b", re.IGNORECASE),
+        "BXDS beamline IVU IVW diffraction SAXS grazing incidence pair distribution function",
+    ),
+    (
+        re.compile(r"\b(lew|hew)\b", re.IGNORECASE),
+        "IVW wiggler beamline low energy wiggler high energy wiggler",
+    ),
+]
 
 
 def repair_query(query: str) -> Dict[str, Any]:
@@ -25,11 +41,10 @@ def repair_query(query: str) -> Dict[str, Any]:
             notes.append(note)
 
     lowered = search_query.lower()
-    expansions = [
-        expansion
-        for trigger, expansion in QUERY_EXPANSIONS.items()
-        if trigger in lowered and expansion.lower() not in lowered
-    ]
+    expansions = []
+    for pattern, expansion in QUERY_EXPANSIONS:
+        if pattern.search(search_query) and expansion.lower() not in lowered:
+            expansions.append(expansion)
 
     if expansions:
         search_query = f"{search_query} {' '.join(expansions)}"
