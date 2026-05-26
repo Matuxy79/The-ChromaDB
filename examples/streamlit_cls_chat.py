@@ -2,6 +2,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from examples.cls_filters import prism_to_metadata_filter
+from examples.cls_query_repair import repair_query
 from examples.cls_safety import detect_safety_topic, low_confidence
 
 
@@ -9,17 +10,18 @@ def retrieve_evidence(
     q: str,
     kb,
     active_prism: Optional[str],
-) -> Tuple[List[Dict[str, Any]], float]:
+) -> Tuple[List[Dict[str, Any]], float, Dict[str, Any]]:
     """Run semantic retrieval and return hits plus wall-clock latency."""
     mfilter = prism_to_metadata_filter(active_prism)
+    query_info = repair_query(q)
     start = time.perf_counter()
     rag_results = kb.query(
-        [q],
+        [query_info["search"]],
         metadata_filter=mfilter,
         rse_params="balanced",
     )
     latency = time.perf_counter() - start
-    return rag_results, latency
+    return rag_results, latency, query_info
 
 
 def build_flags(q: str, hits: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -56,5 +58,5 @@ def format_evidence_answer(hits: List[Dict[str, Any]]) -> str:
 
 def handle_user_message(q: str, kb, provider, active_prism: Optional[str]):
     """Backward-compatible generator API for older callers."""
-    hits, _ = retrieve_evidence(q, kb, active_prism)
+    hits, _, _ = retrieve_evidence(q, kb, active_prism)
     yield format_evidence_answer(hits)

@@ -239,6 +239,12 @@ def render_retrieval_trace(trace: Optional[Dict[str, Any]]) -> None:
     latency = trace.get("latency", 0.0)
     label = f"🔍 Retrieval trace — {len(hits)} hit(s) · {format_seconds(latency)}"
     with st.expander(label, expanded=False):
+        query_info = trace.get("query_info") or {}
+        if query_info.get("changed"):
+            st.caption(f"Search query repaired: {query_info.get('search')}")
+            notes = query_info.get("notes") or []
+            if notes:
+                st.caption(" ".join(notes))
         if not hits:
             st.caption("No evidence retrieved for this query.")
             return
@@ -395,8 +401,8 @@ if prompt:
         flags: Dict[str, Any] = {}
 
         try:
-            hits, latency = retrieve_evidence(prompt, kb, lane_filter)
-            trace = {"hits": hits, "latency": latency}
+            hits, latency, query_info = retrieve_evidence(prompt, kb, lane_filter)
+            trace = {"hits": hits, "latency": latency, "query_info": query_info}
             flags = build_flags(prompt, hits)
             with flags_slot.container():
                 render_flags(flags, lane_filter)

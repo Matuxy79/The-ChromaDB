@@ -53,6 +53,7 @@ The current UI shows progress per stage and batches embeddings so the user sees 
 The prototype is retrieval-only:
 
 - User question -> embedding -> Chroma vector search.
+- Silent deterministic query repair handles known beamline acronym typos before embedding.
 - Optional lane filter -> narrower source set.
 - UI renders the top evidence chunks and retrieval trace.
 

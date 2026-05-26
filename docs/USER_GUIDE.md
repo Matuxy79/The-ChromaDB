@@ -88,6 +88,8 @@ Leave it on **None** to search across all lanes. If a lane is set and the app sa
 
 Type into the chat box at the bottom. The system uses the embedding model for semantic retrieval, then returns matching source chunks directly. There is no chat LLM in the answer path.
 
+Before searching, the app silently repairs a small set of known beamline acronym typos, such as `ivw` -> `IVU`. Open the retrieval trace to see the repaired search query.
+
 Three things appear under each answer:
 
 1. **Safety banner** (orange) — only if the question touches a safety topic. Lists emergency numbers and reminds the scientist to confirm procedures with staff. See [SAFETY.md](SAFETY.md).
