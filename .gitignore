@@ -1,0 +1,47 @@
+# ─── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ─── Virtual env ───────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ─── Local indices and binary state ────────────────────────────────────────
+# ChromaDB persistent stores. Names follow `<kb_id>_chroma_db/`.
+*_chroma_db/
+chroma.sqlite3
+*.parquet
+
+# ─── Logs ──────────────────────────────────────────────────────────────────
+ollama.log
+*.log
+
+# ─── Document inbox / processed / failed ───────────────────────────────────
+# These hold scientist-uploaded PDFs that should not be redistributed.
+docs/inbox/*
+docs/processed/*
+docs/failed/*
+!docs/inbox/.gitkeep
+!docs/processed/.gitkeep
+!docs/failed/.gitkeep
+
+# ─── Source training corpus (not redistributable) ──────────────────────────
+Training for perfect in ui graded/
+
+# ─── Editor / OS ───────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*~
+*.swp
+
+# ─── Build artefacts ───────────────────────────────────────────────────────
+dist/
+build/
