@@ -36,6 +36,12 @@ class QueryRepairTests(unittest.TestCase):
         self.assertIn("BXDS", repaired["search"])
         self.assertIn("Corrected BXD to BXDS.", repaired["notes"])
 
+    def test_wiggler_expands_toward_ivw_not_ivu(self):
+        repaired = repair_query("wiggler beamline")
+
+        self.assertIn("IVW low energy wiggler", repaired["search"])
+        self.assertNotIn("IVU beamline BXDS", repaired["search"])
+
 
 if __name__ == "__main__":
     unittest.main()

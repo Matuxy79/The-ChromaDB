@@ -6,16 +6,17 @@ A domain-specific Retrieval-Augmented and Cache-Augmented Generation (RAG+CAG) s
 
 This prototype separates indexing from scientist-facing retrieval:
 - **Offline Indexing Daemon:** A one-time or background maintenance process extracts text from documents (PDF, TXT), generates embeddings using `nomic-embed-text`, and stores them in local ChromaDB with Prism lane metadata.
-- **Fast Evidence Chat UI:** The Streamlit app is optimized for scientists asking questions conversationally. It performs Prism-filtered vector search and returns source-backed evidence snippets without a chat LLM.
+- **Scientist Chat UI:** The Streamlit app is optimized for scientists asking questions conversationally. It performs Prism-filtered vector search, then a small local chat LLM writes a readable answer from the retrieved evidence with source-row citations.
 
 The intended operating model is: index documents once, then keep the chatbot open for fast repeated question-answering.
 
 ## Prerequisites
 
 1. Install [Ollama](https://ollama.com/).
-2. Pull the required embedding model:
+2. Pull the required local models:
    ```bash
    ollama pull nomic-embed-text
+   ollama pull llama3.2:1b
    ```
 
 ## Quick Launch
@@ -61,13 +62,14 @@ Optional per-file metadata can be added with a sidecar JSON file such as `manual
 - An **offline-only pill** at the top right: green when Ollama is reachable on `127.0.0.1:11434`, red otherwise. The chat input is disabled while it's red.
 - **Per-file progress bars** during indexing — `Extract → Chunk → Embed → Store` — with a running mm:ss timer and a final `chunks/s` rate. PDF extraction now runs page-parallel; embedding runs in batches of 16 so the bar moves every couple of seconds instead of waiting for the whole document.
 - A silent **query repair** step for common beamline acronym spacing/typos while preserving distinct acronyms like `IVU` and `IVW`.
+- A local **LLM summary** answer mode by default, plus an **Evidence rows** mode for fast debugging and retrieval timing.
 - A collapsible **retrieval trace** under every assistant answer showing the top-k hits, their lane, distance, and a preview, plus the retrieval latency.
 
 ## Model Roles
 
 - **Document lane is not an LLM feature.** It is metadata stored on every chunk as `colour_code`, then used by ChromaDB as a fast filter at query time.
 - **Indexing needs the embedding model** (`nomic-embed-text`) so chunks can be searched semantically. This is the slow part on CPU.
-- **No chat LLM is used.** The app returns deterministic source snippets from ChromaDB instead of generated prose.
+- **Chat answers use a small local LLM** (`llama3.2:1b`) to turn retrieved chunks into readable Markdown with source-row citations. It is not used for indexing.
 - **Query repair is deterministic.** It expands known CLS beamline acronyms before retrieval; no hidden language model is called.
 
 ## Guide Docs

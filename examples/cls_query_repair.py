@@ -27,6 +27,10 @@ QUERY_EXPANSIONS: List[Tuple[re.Pattern[str], str]] = [
         re.compile(r"\b(lew|hew)\b", re.IGNORECASE),
         "IVW wiggler beamline low energy wiggler high energy wiggler",
     ),
+    (
+        re.compile(r"\bwiggler\b", re.IGNORECASE),
+        "IVW low energy wiggler LEW high energy wiggler HEW",
+    ),
 ]
 
 

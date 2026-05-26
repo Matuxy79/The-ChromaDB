@@ -14,6 +14,7 @@ class KnowledgeBase:
         kb_id: str,
         embedding_model,
         vector_db,
+        auto_context_model=None,
         reranker=None,
         chunk_size: int = 900,
         chunk_overlap: int = 120,
@@ -21,6 +22,7 @@ class KnowledgeBase:
         self.kb_id = kb_id
         self.embedding_model = embedding_model
         self.vector_db = vector_db
+        self.auto_context_model = auto_context_model
         self.reranker = reranker
         self._splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,

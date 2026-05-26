@@ -9,7 +9,14 @@ import streamlit as st
 from examples.cls_ingest import ingest_document
 from examples.cls_kb_setup import build_cls_kb
 from examples.cls_safety import EMERGENCY_CONTACTS, LOW_CONFIDENCE_DISTANCE
-from examples.streamlit_cls_chat import build_flags, format_evidence_answer, retrieve_evidence
+from examples.streamlit_cls_chat import (
+    build_flags,
+    clean_llm_answer,
+    format_evidence_answer,
+    format_evidence_packet,
+    retrieve_evidence,
+    stream_llm_answer,
+)
 
 
 LANES = ["None", "purple", "green", "blue", "orange", "yellow"]
@@ -237,7 +244,10 @@ def render_retrieval_trace(trace: Optional[Dict[str, Any]]) -> None:
         return
     hits: List[Dict[str, Any]] = trace.get("hits", [])
     latency = trace.get("latency", 0.0)
+    generation_seconds = trace.get("generation_seconds")
     label = f"🔍 Retrieval trace — {len(hits)} hit(s) · {format_seconds(latency)}"
+    if generation_seconds is not None:
+        label += f" · LLM {format_seconds(generation_seconds)}"
     with st.expander(label, expanded=False):
         query_info = trace.get("query_info") or {}
         if query_info.get("changed"):
@@ -277,6 +287,12 @@ with st.sidebar:
         if st.button("Re-check", use_container_width=True, help="Re-probe Ollama"):
             st.session_state.ollama_online = kb.embedding_model.is_available()
             st.rerun()
+
+    answer_mode = st.selectbox(
+        "Answer mode",
+        ["LLM summary", "Evidence rows"],
+        index=0,
+    )
 
     if st.button("Clear chat", use_container_width=True):
         st.session_state.messages = []
@@ -363,7 +379,7 @@ with pill_col:
         f"</div>",
         unsafe_allow_html=True,
     )
-st.caption("Fast local semantic retrieval over the indexed CLS knowledge base. No chat LLM is used.")
+st.caption("Local RAG over the indexed CLS knowledge base. Answers are composed from retrieved evidence.")
 
 
 # ─── Chat transcript ───────────────────────────────────────────────────────
@@ -407,17 +423,58 @@ if prompt:
             with flags_slot.container():
                 render_flags(flags, lane_filter)
 
-            full_response = format_evidence_answer(hits)
-            response_container.markdown(full_response)
-            status.update(
-                label=f"Evidence ready · {len(hits)} hit(s) in {format_seconds(latency)}",
-                state="complete",
-                expanded=False,
-            )
+            if answer_mode == "Evidence rows":
+                full_response = format_evidence_answer(hits)
+                response_container.markdown(full_response)
+                status.update(
+                    label=f"Evidence ready · {len(hits)} hit(s) in {format_seconds(latency)}",
+                    state="complete",
+                    expanded=False,
+                )
+            else:
+                generation_start = time.perf_counter()
+                status.update(
+                    label=f"Evidence ready · {len(hits)} hit(s) in {format_seconds(latency)} · composing answer",
+                    state="running",
+                    expanded=False,
+                )
+                try:
+                    for chunk in stream_llm_answer(
+                        prompt,
+                        hits,
+                        kb.auto_context_model,
+                        safety_topic=flags.get("safety_topic"),
+                        retrieval_is_low_confidence=flags.get("low_confidence", False),
+                    ):
+                        full_response += chunk
+                        response_container.markdown(full_response + "▌")
+                    full_response = clean_llm_answer(
+                        full_response,
+                        format_evidence_packet(prompt, hits),
+                    )
+                    response_container.markdown(full_response)
+                    generation_seconds = time.perf_counter() - generation_start
+                    trace["generation_seconds"] = generation_seconds
+                    status.update(
+                        label=(
+                            f"Answer ready · {len(hits)} hit(s) in {format_seconds(latency)} · "
+                            f"LLM {format_seconds(generation_seconds)}"
+                        ),
+                        state="complete",
+                        expanded=False,
+                    )
+                except Exception as llm_exc:
+                    full_response = format_evidence_answer(hits)
+                    response_container.markdown(full_response)
+                    status.update(
+                        label=f"LLM failed, showing evidence rows: {llm_exc}",
+                        state="error",
+                        expanded=True,
+                    )
         except Exception as exc:
             full_response = (
-                "The local embedding service returned an error. "
-                "Confirm Ollama is running and nomic-embed-text is installed."
+                "The local model service returned an error. "
+                "Confirm Ollama is running and the required local models are installed."
             )
             status.update(label=f"Retrieval failed: {exc}", state="error", expanded=True)
             st.session_state.ollama_online = kb.embedding_model.is_available()
@@ -431,4 +488,5 @@ if prompt:
         "trace": trace,
         "flags": flags,
         "lane": lane_filter,
+        "mode": answer_mode,
     })

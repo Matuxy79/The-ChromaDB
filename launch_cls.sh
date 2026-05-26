@@ -136,6 +136,7 @@ ensure_requirements
 if [ "${SKIP_OLLAMA_CHECK:-0}" != "1" ]; then
     ensure_ollama_server
     ensure_model "nomic-embed-text"
+    ensure_model "llama3.2:1b"
 else
     say "Skipping Ollama checks because SKIP_OLLAMA_CHECK=1."
 fi

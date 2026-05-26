@@ -86,7 +86,9 @@ Leave it on **None** to search across all lanes. If a lane is set and the app sa
 
 ## 4. Asking a question
 
-Type into the chat box at the bottom. The system uses the embedding model for semantic retrieval, then returns matching source chunks directly. There is no chat LLM in the answer path.
+Type into the chat box at the bottom. The system uses the embedding model for semantic retrieval, then the small local chat model writes a readable Markdown answer from those retrieved rows.
+
+Use **Answer mode → Evidence rows** in the sidebar when you want the fastest possible source preview without generated prose.
 
 Before searching, the app silently repairs a small set of known beamline acronym spacing/typos. `IVU` and `IVW` are treated as distinct beamline concepts. Open the retrieval trace to see the repaired search query.
 
@@ -96,22 +98,22 @@ Three things appear under each answer:
 2. **Low-confidence card** (yellow) — only if the best retrieval distance is past `0.55`. The answer is still shown, but treat it as a lead.
 3. **Retrieval trace** — collapsible expander labelled `🔍 Retrieval trace — N hit(s) · X ms`. Open it to see source filename, lane, domain, vector distance, and a 120-character preview for each chunk the model used.
 
-The trace is the citation. If the trace looks wrong, the answer is wrong.
+The answer citations (`[1]`, `[2]`, etc.) refer to rows in this trace. If the trace looks wrong, the answer is wrong.
 
 ---
 
 ## 5. Speed expectations
 
-On a typical CLS workstation (CPU-only, `nomic-embed-text`):
+On a typical CLS workstation (CPU-only, `nomic-embed-text` + `llama3.2:1b`):
 
 | Action                              | Wall time         |
 | ----------------------------------- | ----------------- |
 | App cold-start                      | 2–4 s             |
 | Indexing 7 MB / 100-page PDF        | 45–75 s           |
-| First question after model load     | 2–6 s             |
-| Subsequent questions                | usually under 2 s |
+| First question after model load     | 5–15 s            |
+| Subsequent questions                | 2–8 s             |
 
-The embedding model is the floor on CPU. If you want true speedups, run Ollama on GPU or reduce chunk count.
+Embedding is the indexing floor on CPU; chat generation is the answer-time floor. If you want true speedups, run Ollama on GPU or switch to **Evidence rows** mode for retrieval testing.
 
 ---
 

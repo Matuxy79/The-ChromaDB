@@ -14,7 +14,7 @@ This prototype is not a safety authority. It is a local evidence assistant that 
 - vacuum failure
 - fire, medical, evacuation, injury
 
-When a trigger matches, the UI shows a safety card with emergency contacts. Because the prototype is retrieval-only, no language model receives or rewrites safety instructions.
+When a trigger matches, the UI shows a safety card with emergency contacts and the local chat model receives stricter instructions: answer only from retrieved evidence, do not improvise procedures, and point the user to beamline staff or emergency contacts when evidence is incomplete.
 
 The interface should still be read conservatively:
 
