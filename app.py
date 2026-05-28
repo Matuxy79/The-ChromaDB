@@ -1,492 +1,550 @@
-import os
-import tempfile
-import time
-from typing import Any, Dict, List, Optional
+from __future__ import annotations
 
-import pandas as pd
+import hashlib
+import math
+import os
+import re
+import tempfile
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+import chromadb
+import fitz
 import streamlit as st
 
-from examples.cls_ingest import ingest_document
-from examples.cls_kb_setup import build_cls_kb
-from examples.cls_safety import EMERGENCY_CONTACTS, LOW_CONFIDENCE_DISTANCE
-from examples.streamlit_cls_chat import (
-    build_flags,
-    clean_llm_answer,
-    format_evidence_answer,
-    format_evidence_packet,
-    retrieve_evidence,
-    stream_llm_answer,
+
+APP_ROOT = Path(__file__).resolve().parent
+MANUAL_DIR = APP_ROOT / "Training for perfect in ui graded"
+DEFAULT_MANUAL = MANUAL_DIR / "IVU beamline manual - Apr 10 2026.pdf"
+CHROMA_DIR = APP_ROOT / "chroma_store"
+COLLECTION_NAME = "cls_ivu_manual_hash_v1"
+EMBED_DIM = 512
+CHUNK_TARGET_CHARS = 1100
+CHUNK_OVERLAP_CHARS = 180
+
+
+st.set_page_config(
+    page_title="CLS IVU Manual Query Prototype",
+    page_icon="🔬",
+    layout="wide",
 )
 
 
-LANES = ["None", "purple", "green", "blue", "orange", "yellow"]
-DOMAINS = ["beamline", "research", "outreach", "logistics", "education"]
-STAGE_ORDER = ["extract", "chunk", "embed", "store"]
-STAGE_LABEL = {
-    "extract": "📄 Extract",
-    "chunk":   "✂️ Chunk",
-    "embed":   "🧠 Embed",
-    "store":   "💾 Store",
-}
+@dataclass(frozen=True)
+class Chunk:
+    text: str
+    metadata: dict
+    chunk_id: str
 
 
-st.set_page_config(page_title="CLS RAG+CAG Chat", layout="wide", page_icon="🔬")
+class HashEmbedder:
+    """Small deterministic embedding model for offline technical-manual retrieval."""
+
+    def __init__(self, dimensions: int = EMBED_DIM) -> None:
+        self.dimensions = dimensions
+
+    def embed(self, texts: Iterable[str]) -> list[list[float]]:
+        return [self._embed_one(text) for text in texts]
+
+    def _embed_one(self, text: str) -> list[float]:
+        tokens = re.findall(r"[a-zA-Z0-9][a-zA-Z0-9_\-/\.]*", text.lower())
+        features: Counter[str] = Counter(tokens)
+        features.update(f"{a} {b}" for a, b in zip(tokens, tokens[1:]))
+
+        vector = [0.0] * self.dimensions
+        for feature, count in features.items():
+            digest = hashlib.blake2b(feature.encode("utf-8"), digest_size=8).digest()
+            bucket = int.from_bytes(digest[:4], "little") % self.dimensions
+            sign = 1.0 if digest[4] % 2 == 0 else -1.0
+            vector[bucket] += sign * (1.0 + math.log(count))
+
+        norm = math.sqrt(sum(value * value for value in vector))
+        if norm == 0:
+            return vector
+        return [value / norm for value in vector]
 
 
-CUSTOM_CSS = """
-<style>
-.stApp [data-testid="stChatMessage"] {
-    border-radius: 14px;
-    padding: 0.65rem 0.9rem;
-    margin-bottom: 0.45rem;
-}
-.cls-pill {
-    display: inline-block;
-    padding: 0.18rem 0.65rem;
-    border-radius: 999px;
-    font-size: 0.78rem;
-    font-weight: 600;
-    letter-spacing: 0.02em;
-    vertical-align: middle;
-    margin-left: 0.5rem;
-}
-.cls-pill-online  { background: #10331f; color: #57e08a; border: 1px solid #1f6a3b; }
-.cls-pill-offline { background: #3a1414; color: #ff8b8b; border: 1px solid #7a2424; }
-.cls-stage-row {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 0.82rem;
-    color: #c9c9c9;
-}
-.cls-summary-card {
-    background: rgba(255,255,255,0.04);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 10px;
-    padding: 0.6rem 0.85rem;
-    margin-top: 0.4rem;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 0.82rem;
-}
-.cls-safety-card {
-    background: #3a1e08;
-    border: 1px solid #b85d18;
-    border-left: 4px solid #ff8b2a;
-    border-radius: 10px;
-    padding: 0.7rem 0.95rem;
-    margin: 0.5rem 0 0.3rem;
-    font-size: 0.88rem;
-    color: #ffdcb6;
-}
-.cls-safety-card .cls-safety-head {
-    font-weight: 700;
-    font-size: 0.95rem;
-    color: #ffb574;
-    margin-bottom: 0.35rem;
-}
-.cls-safety-card table { width: 100%; border-collapse: collapse; font-family: ui-monospace, monospace; font-size: 0.8rem; }
-.cls-safety-card th, .cls-safety-card td { text-align: left; padding: 0.15rem 0.5rem 0.15rem 0; }
-.cls-safety-card th { color: #ffb574; border-bottom: 1px solid #6a3a16; }
-.cls-warn-card {
-    background: #2c2510;
-    border: 1px solid #806118;
-    border-left: 4px solid #e3b341;
-    border-radius: 10px;
-    padding: 0.55rem 0.85rem;
-    margin: 0.4rem 0 0.2rem;
-    font-size: 0.84rem;
-    color: #f7e0a0;
-}
-.cls-info-card {
-    background: #11253a;
-    border: 1px solid #1f4a78;
-    border-left: 4px solid #5aaaff;
-    border-radius: 10px;
-    padding: 0.55rem 0.85rem;
-    margin: 0.4rem 0 0.2rem;
-    font-size: 0.84rem;
-    color: #cfe5ff;
-}
-</style>
-"""
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+@st.cache_resource(show_spinner=False)
+def get_embedder() -> HashEmbedder:
+    return HashEmbedder()
 
 
-@st.cache_resource
-def init_kb():
-    return build_cls_kb()
+@st.cache_resource(show_spinner=False)
+def get_chroma_client() -> chromadb.PersistentClient:
+    return chromadb.PersistentClient(path=str(CHROMA_DIR))
 
 
-kb = init_kb()
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "ollama_online" not in st.session_state:
-    st.session_state.ollama_online = kb.embedding_model.is_available()
-
-
-def render_offline_pill(online: bool) -> str:
-    if online:
-        return '<span class="cls-pill cls-pill-online">● Offline-only · Ollama reachable</span>'
-    return '<span class="cls-pill cls-pill-offline">○ Ollama unreachable</span>'
+@st.cache_resource(show_spinner=False)
+def get_collection() -> chromadb.Collection:
+    return get_chroma_client().get_or_create_collection(
+        name=COLLECTION_NAME,
+        metadata={
+            "description": "CLS IVU beamline manual extractive retrieval prototype",
+            "embedding": f"local_hash_{EMBED_DIM}d",
+            "hnsw:space": "cosine",
+        },
+    )
 
 
-def format_seconds(seconds: float) -> str:
-    if seconds < 1:
-        return f"{seconds*1000:.0f} ms"
-    if seconds < 60:
-        return f"{seconds:.1f} s"
-    minutes, secs = divmod(seconds, 60)
-    return f"{int(minutes)}m {secs:04.1f}s"
+def file_signature(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(block)
+    return hasher.hexdigest()[:16]
 
 
-class StageRenderer:
-    """Per-file progress board rendered into a Streamlit container."""
+def uploaded_signature(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()[:16]
 
-    def __init__(self, container, filename: str):
-        self.container = container
-        self.start = time.perf_counter()
-        with container:
-            st.markdown(f"**{filename}**")
-            self.timer_slot = st.empty()
-            self.bar_slots: Dict[str, Any] = {}
-            self.label_slots: Dict[str, Any] = {}
-            for stage in STAGE_ORDER:
-                self.label_slots[stage] = st.empty()
-                self.bar_slots[stage] = st.progress(0, text=STAGE_LABEL[stage])
-        self._tick_timer()
 
-    def _tick_timer(self) -> None:
-        elapsed = time.perf_counter() - self.start
-        self.timer_slot.markdown(
-            f"<span class='cls-stage-row'>⏱ {format_seconds(elapsed)} elapsed</span>",
-            unsafe_allow_html=True,
-        )
+def load_pdf(path: Path) -> list[tuple[int, str]]:
+    pages: list[tuple[int, str]] = []
+    with fitz.open(path) as document:
+        for page_index, page in enumerate(document, start=1):
+            text = page.get_text("text").strip()
+            if text:
+                pages.append((page_index, text))
+    return pages
 
-    def __call__(self, stage: str, current: int, total: int) -> None:
-        if stage not in self.bar_slots:
+
+def load_text(path: Path) -> list[tuple[int, str]]:
+    text = path.read_text(encoding="utf-8", errors="replace").strip()
+    return [(1, text)] if text else []
+
+
+def load_document(path: Path) -> list[tuple[int, str]]:
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return load_pdf(path)
+    if suffix in {".txt", ".md"}:
+        return load_text(path)
+    raise ValueError(f"Unsupported file type: {suffix}. Use PDF, TXT, or MD.")
+
+
+def detect_section(text: str, fallback: str) -> str:
+    for line in text.splitlines()[:12]:
+        clean = re.sub(r"\s+", " ", line).strip()
+        if re.match(r"^\d+(\.\d+)*\s+[A-ZA-Za-z]", clean):
+            return clean[:120]
+        if 8 <= len(clean) <= 90 and clean[:1].isupper() and not clean.endswith("."):
+            return clean[:120]
+    return fallback
+
+
+def split_page_text(
+    text: str,
+    page_number: int,
+    source_name: str,
+    source_hash: str,
+    starting_index: int,
+) -> list[Chunk]:
+    section = detect_section(text, f"Page {page_number}")
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+    chunks: list[Chunk] = []
+    buffer = ""
+    chunk_index = starting_index
+
+    def flush() -> None:
+        nonlocal buffer, chunk_index
+        clean = re.sub(r"\n{3,}", "\n\n", buffer).strip()
+        if not clean:
             return
-        pct = (current / total) if total else 1.0
-        pct = max(0.0, min(pct, 1.0))
-        self.bar_slots[stage].progress(pct, text=f"{STAGE_LABEL[stage]} — {current}/{total}")
-        self._tick_timer()
-
-    def finish(self, stats: Dict[str, Any]) -> None:
-        elapsed = time.perf_counter() - self.start
-        chunks = stats.get("chunks", 0)
-        pages = stats.get("pages", 0)
-        rate = chunks / elapsed if elapsed > 0 else 0.0
-        per_stage = " · ".join(
-            f"{STAGE_LABEL[s]} {format_seconds(stats.get(f'{s}_seconds', 0.0))}"
-            for s in STAGE_ORDER
-            if f"{s}_seconds" in stats
-        )
-        with self.container:
-            st.markdown(
-                "<div class='cls-summary-card'>"
-                f"✅ <b>{stats.get('file', '')}</b><br>"
-                f"{pages} page(s) · {chunks} chunk(s) · {format_seconds(elapsed)} total · "
-                f"{rate:.1f} chunks/s<br>"
-                f"{per_stage}"
-                "</div>",
-                unsafe_allow_html=True,
+        context_text = f"Source: {source_name}\nSection: {section}\nPage: {page_number}\n\n{clean}"
+        chunk_id = f"{source_hash}:{chunk_index:05d}"
+        chunks.append(
+            Chunk(
+                text=context_text,
+                metadata={
+                    "source": source_name,
+                    "source_hash": source_hash,
+                    "page": page_number,
+                    "section": section,
+                    "chunk_index": chunk_index,
+                },
+                chunk_id=chunk_id,
             )
+        )
+        overlap = clean[-CHUNK_OVERLAP_CHARS:] if len(clean) > CHUNK_OVERLAP_CHARS else clean
+        buffer = overlap
+        chunk_index += 1
+
+    for paragraph in paragraphs:
+        candidate = f"{buffer}\n\n{paragraph}".strip() if buffer else paragraph
+        if len(candidate) > CHUNK_TARGET_CHARS and buffer:
+            flush()
+            buffer = paragraph
+        else:
+            buffer = candidate
+
+        while len(buffer) > CHUNK_TARGET_CHARS * 1.4:
+            cut = buffer.rfind(". ", 0, CHUNK_TARGET_CHARS)
+            if cut < CHUNK_TARGET_CHARS // 2:
+                cut = CHUNK_TARGET_CHARS
+            head, buffer = buffer[: cut + 1], buffer[cut + 1 :]
+            saved_buffer = buffer
+            buffer = head
+            flush()
+            buffer = f"{head[-CHUNK_OVERLAP_CHARS:]}\n\n{saved_buffer}".strip()
+
+    flush()
+    return chunks
 
 
-def _emergency_contact_table() -> str:
-    rows = "".join(
-        f"<tr><td>{c['who']}</td><td><b>{c['number']}</b></td><td>{c['note']}</td></tr>"
-        for c in EMERGENCY_CONTACTS
+def build_chunks(path: Path, source_hash: str) -> list[Chunk]:
+    pages = load_document(path)
+    chunks: list[Chunk] = []
+    next_index = 0
+    for page_number, text in pages:
+        page_chunks = split_page_text(
+            text=text,
+            page_number=page_number,
+            source_name=path.name,
+            source_hash=source_hash,
+            starting_index=next_index,
+        )
+        chunks.extend(page_chunks)
+        next_index += len(page_chunks)
+    return chunks
+
+
+def collection_count(collection: chromadb.Collection) -> int:
+    try:
+        return collection.count()
+    except Exception:
+        return 0
+
+
+def source_is_indexed(collection: chromadb.Collection, source_hash: str) -> bool:
+    result = collection.get(where={"source_hash": source_hash}, limit=1)
+    return bool(result.get("ids"))
+
+
+def ingest_path(path: Path, source_hash: str, force: bool = False) -> tuple[int, str]:
+    collection = get_collection()
+    if source_is_indexed(collection, source_hash):
+        if not force:
+            return 0, "already indexed"
+        existing = collection.get(where={"source_hash": source_hash})
+        if existing.get("ids"):
+            collection.delete(ids=existing["ids"])
+
+    chunks = build_chunks(path, source_hash)
+    if not chunks:
+        return 0, "no readable text found"
+
+    embeddings = get_embedder().embed(chunk.text for chunk in chunks)
+    collection.add(
+        ids=[chunk.chunk_id for chunk in chunks],
+        documents=[chunk.text for chunk in chunks],
+        metadatas=[chunk.metadata for chunk in chunks],
+        embeddings=embeddings,
     )
-    return (
-        "<table><thead><tr><th>Contact</th><th>Number</th><th>Note</th></tr></thead>"
-        f"<tbody>{rows}</tbody></table>"
+    return len(chunks), "indexed"
+
+
+def reset_collection() -> None:
+    client = get_chroma_client()
+    try:
+        client.delete_collection(COLLECTION_NAME)
+    except Exception:
+        pass
+    get_collection.clear()
+
+
+def query_manual(query: str, n_results: int = 8) -> list[dict]:
+    collection = get_collection()
+    if collection_count(collection) == 0:
+        return []
+
+    result = collection.query(
+        query_embeddings=get_embedder().embed([query]),
+        n_results=n_results,
+        include=["documents", "metadatas", "distances"],
     )
 
+    rows: list[dict] = []
+    documents = result.get("documents", [[]])[0]
+    metadatas = result.get("metadatas", [[]])[0]
+    distances = result.get("distances", [[]])[0]
+    for document, metadata, distance in zip(documents, metadatas, distances):
+        score = max(0.0, min(1.0, 1.0 - float(distance)))
+        rows.append({"document": document, "metadata": metadata or {}, "distance": distance, "score": score})
+    return rows
 
-def render_flags(flags: Optional[Dict[str, Any]], active_prism: Optional[str]) -> None:
-    if not flags:
-        return
 
-    topic = flags.get("safety_topic")
-    if topic:
-        st.markdown(
-            "<div class='cls-safety-card'>"
-            f"<div class='cls-safety-head'>⚠ Safety topic detected — {topic.replace('_', ' ')}</div>"
-            "For an active emergency call <b>911</b> or U-Sask Security "
-            "<b>9-306-966-5555</b>. This tool only retrieves indexed evidence; "
-            "confirm any procedure with beamline staff before acting.<br><br>"
-            f"{_emergency_contact_table()}"
-            "</div>",
-            unsafe_allow_html=True,
+def lexical_terms(text: str) -> set[str]:
+    stop_words = {
+        "about",
+        "after",
+        "before",
+        "could",
+        "from",
+        "have",
+        "into",
+        "manual",
+        "procedure",
+        "should",
+        "tell",
+        "that",
+        "their",
+        "there",
+        "these",
+        "this",
+        "what",
+        "when",
+        "where",
+        "which",
+        "with",
+        "would",
+    }
+    return {
+        token
+        for token in re.findall(r"[a-zA-Z0-9][a-zA-Z0-9_\-/\.]*", text.lower())
+        if len(token) > 2 and token not in stop_words
+    }
+
+
+def extract_sentences(text: str) -> list[str]:
+    body = re.sub(r"^Source:.*?\nSection:.*?\nPage:.*?\n\n", "", text, flags=re.S)
+    normalized = re.sub(r"\s+", " ", body)
+    return [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", normalized) if sentence.strip()]
+
+
+def build_extractive_answer(query: str, rows: list[dict], max_sentences: int = 5) -> list[str]:
+    terms = lexical_terms(query)
+    candidates: list[tuple[int, float, str, dict]] = []
+    for row in rows[:5]:
+        for sentence in extract_sentences(row["document"]):
+            sentence_terms = lexical_terms(sentence)
+            overlap = len(terms & sentence_terms)
+            if overlap:
+                candidates.append((overlap, row["score"], sentence, row["metadata"]))
+
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda item: (item[0], item[1], len(item[2])), reverse=True)
+    chosen: list[str] = []
+    seen: set[str] = set()
+    for _, _, sentence, metadata in candidates:
+        clean = sentence.strip()
+        key = clean.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        source = metadata.get("source", "source")
+        page = metadata.get("page", "?")
+        chosen.append(f"{clean} [Source: {source}, page {page}]")
+        if len(chosen) >= max_sentences:
+            break
+    return chosen
+
+
+def merge_adjacent_segments(rows: list[dict]) -> list[dict]:
+    if not rows:
+        return []
+    by_source: dict[str, dict[int, dict]] = {}
+    for row in rows:
+        meta = row["metadata"]
+        by_source.setdefault(meta.get("source_hash", ""), {})[int(meta.get("chunk_index", -1))] = row
+
+    merged: list[dict] = []
+    used: set[tuple[str, int]] = set()
+    for row in rows[:4]:
+        meta = row["metadata"]
+        source_hash = meta.get("source_hash", "")
+        index = int(meta.get("chunk_index", -1))
+        key = (source_hash, index)
+        if key in used:
+            continue
+        neighbors = []
+        for candidate_index in range(index - 1, index + 2):
+            neighbor = by_source.get(source_hash, {}).get(candidate_index)
+            if neighbor:
+                neighbors.append(neighbor)
+                used.add((source_hash, candidate_index))
+        merged.append(
+            {
+                "metadata": meta,
+                "score": max(neighbor["score"] for neighbor in neighbors),
+                "document": "\n\n--- adjacent segment ---\n\n".join(neighbor["document"] for neighbor in neighbors),
+                "parts": len(neighbors),
+            }
         )
+    return merged
 
-    if flags.get("low_confidence"):
-        st.markdown(
-            "<div class='cls-warn-card'>"
-            "🟡 <b>Low-confidence retrieval.</b> The best matching chunk is past the "
-            f"distance threshold ({LOW_CONFIDENCE_DISTANCE:.2f}). Treat the answer as a "
-            "lead, not a citation, and check the source row in the retrieval trace."
-            "</div>",
-            unsafe_allow_html=True,
+
+EVAL_CASES = [
+    {
+        "question": "Who are the IVU beamline contacts and phone numbers?",
+        "keywords": ["beatriz", "narayan", "al", "3868", "3648", "3530"],
+    },
+    {
+        "question": "What are the emergency contact numbers for fire or ambulance?",
+        "keywords": ["911", "security", "306-966-5555"],
+    },
+    {
+        "question": "What beamline phone number is listed for the Undulator beamline?",
+        "keywords": ["undulator", "soe-3", "3832"],
+    },
+    {
+        "question": "Where does the manual describe the in-vacuum undulator?",
+        "keywords": ["in-vacuum", "undulator"],
+    },
+]
+
+
+def evaluate_retrieval() -> list[dict]:
+    evaluations: list[dict] = []
+    for case in EVAL_CASES:
+        rows = query_manual(case["question"], n_results=6)
+        combined = " ".join(row["document"].lower() for row in rows[:3])
+        hits = [keyword for keyword in case["keywords"] if keyword.lower() in combined]
+        keyword_score = len(hits) / len(case["keywords"])
+        top_score = rows[0]["score"] if rows else 0.0
+        evaluations.append(
+            {
+                "question": case["question"],
+                "keyword_score": keyword_score,
+                "top_relevance": top_score,
+                "hits": ", ".join(hits) if hits else "none",
+                "status": "pass" if keyword_score >= 0.5 else "review",
+            }
         )
-
-    if flags.get("no_hits") and active_prism:
-        st.markdown(
-            "<div class='cls-info-card'>"
-            f"ℹ No evidence found in the <b>{active_prism}</b> lane. "
-            "Try setting the lane to <b>None</b> to search across all lanes."
-            "</div>",
-            unsafe_allow_html=True,
-        )
+    return evaluations
 
 
-def render_retrieval_trace(trace: Optional[Dict[str, Any]]) -> None:
-    if not trace:
-        return
-    hits: List[Dict[str, Any]] = trace.get("hits", [])
-    latency = trace.get("latency", 0.0)
-    generation_seconds = trace.get("generation_seconds")
-    label = f"🔍 Retrieval trace — {len(hits)} hit(s) · {format_seconds(latency)}"
-    if generation_seconds is not None:
-        label += f" · LLM {format_seconds(generation_seconds)}"
-    with st.expander(label, expanded=False):
-        query_info = trace.get("query_info") or {}
-        if query_info.get("changed"):
-            st.caption(f"Search query repaired: {query_info.get('search')}")
-            notes = query_info.get("notes") or []
-            if notes:
-                st.caption(" ".join(notes))
-        if not hits:
-            st.caption("No evidence retrieved for this query.")
-            return
-        rows = []
-        for idx, hit in enumerate(hits, start=1):
-            meta = hit.get("metadata", {}) or {}
-            text = (hit.get("text") or "").strip().replace("\n", " ")
-            rows.append({
-                "#": idx,
-                "source": meta.get("source_url", "local-doc"),
-                "lane": meta.get("colour_code", "—"),
-                "domain": meta.get("domain", "—"),
-                "distance": round(hit.get("distance"), 4) if hit.get("distance") is not None else None,
-                "preview": (text[:120] + "…") if len(text) > 120 else text,
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+st.title("🔬 CLS IVU Beamline Manual Query")
+st.caption(
+    "Local-first ChromaDB retrieval prototype for offline scientific manual search, extraction, and scoring."
+)
 
-
-# ─── Sidebar ───────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("Retrieval")
-    active_prism = st.selectbox("Prism lane", LANES, index=0)
-    lane_filter = None if active_prism == "None" else active_prism
+    st.header("One-click corpus")
+    st.write("Default manual:")
+    st.code(str(DEFAULT_MANUAL.relative_to(APP_ROOT)) if DEFAULT_MANUAL.exists() else "Missing IVU PDF")
+    force_reindex = st.checkbox("Force rebuild existing IVU index", value=False)
+    if st.button("Index IVU manual", type="primary", use_container_width=True):
+        if DEFAULT_MANUAL.exists():
+            with st.status("Indexing IVU beamline manual...", expanded=True) as status:
+                signature = file_signature(DEFAULT_MANUAL)
+                count, message = ingest_path(DEFAULT_MANUAL, signature, force=force_reindex)
+                st.write(f"ChromaDB status: {message}")
+                st.write(f"Chunks added: {count}")
+                status.update(label="Index ready", state="complete", expanded=False)
+        else:
+            st.error("The default IVU manual PDF was not found.")
 
-    col_metric, col_recheck = st.columns([2, 1])
-    with col_metric:
-        st.metric("Indexed chunks", kb.count_chunks())
-    with col_recheck:
-        st.markdown("&nbsp;")
-        if st.button("Re-check", use_container_width=True, help="Re-probe Ollama"):
-            st.session_state.ollama_online = kb.embedding_model.is_available()
-            st.rerun()
-
-    answer_mode = st.selectbox(
-        "Answer mode",
-        ["LLM summary", "Evidence rows"],
-        index=0,
+    st.header("Upload more docs")
+    uploaded_files = st.file_uploader(
+        "Add PDF, TXT, or MD files",
+        type=["pdf", "txt", "md"],
+        accept_multiple_files=True,
     )
-
-    if st.button("Clear chat", use_container_width=True):
-        st.session_state.messages = []
-        st.rerun()
-
-    with st.expander("Index maintenance", expanded=False):
-        uploaded_files = st.file_uploader(
-            "Add PDF/TXT documents",
-            type=["pdf", "txt"],
-            accept_multiple_files=True,
-        )
-        ingest_lane = st.selectbox(
-            "Index as lane",
-            LANES[1:],
-            index=1,
-            help=(
-                "This is metadata stored with each chunk for fast filtering later. "
-                "It does not call a chat LLM and does not meaningfully slow indexing."
-            ),
-        )
-        domain = st.selectbox("Document domain", DOMAINS, index=0)
-
-        if st.button("Index uploaded files", use_container_width=True):
-            if not uploaded_files:
-                st.warning("No files selected.")
-            elif not st.session_state.ollama_online:
-                st.error("Ollama is offline. Start it before indexing.")
-            else:
-                completed = 0
-                with st.status("Indexing documents…", expanded=True) as status:
-                    overall_start = time.perf_counter()
-                    for uploaded_file in uploaded_files:
-                        suffix = os.path.splitext(uploaded_file.name)[1]
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-                            tmp_file.write(uploaded_file.getvalue())
-                            tmp_path = tmp_file.name
-
-                        metadata = {
-                            "colour_code": ingest_lane,
-                            "domain": domain,
-                            "source_url": uploaded_file.name,
-                            "trust_level": "official_cls",
-                        }
-
-                        file_container = st.container()
-                        renderer = StageRenderer(file_container, uploaded_file.name)
-
-                        try:
-                            stats = ingest_document(
-                                kb,
-                                tmp_path,
-                                metadata,
-                                progress_callback=renderer,
-                            )
-                            if stats:
-                                completed += 1
-                                renderer.finish(stats)
-                            else:
-                                with file_container:
-                                    st.warning(f"No extractable text in {uploaded_file.name}")
-                        except Exception as exc:
-                            with file_container:
-                                st.error(f"Failed: {exc}")
-                        finally:
-                            os.remove(tmp_path)
-
-                    elapsed_all = time.perf_counter() - overall_start
-                    status.update(
-                        label=f"Indexed {completed}/{len(uploaded_files)} · {format_seconds(elapsed_all)}",
-                        state="complete",
-                        expanded=True,
-                    )
-                st.rerun()
-
-
-# ─── Header ────────────────────────────────────────────────────────────────
-title_col, pill_col = st.columns([4, 2])
-with title_col:
-    st.title("🔬 CLS Scientist Chat")
-with pill_col:
-    st.markdown(
-        f"<div style='text-align:right; padding-top:1.6rem;'>"
-        f"{render_offline_pill(st.session_state.ollama_online)}"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-st.caption("Local RAG over the indexed CLS knowledge base. Answers are composed from retrieved evidence.")
-
-
-# ─── Chat transcript ───────────────────────────────────────────────────────
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        if message["role"] == "assistant":
-            render_flags(message.get("flags"), message.get("lane"))
-        st.markdown(message["content"])
-        if message["role"] == "assistant":
-            render_retrieval_trace(message.get("trace"))
-
-
-# ─── Input ─────────────────────────────────────────────────────────────────
-if st.session_state.ollama_online:
-    prompt = st.chat_input("Ask a beamline, procedure, training, or policy question")
-else:
-    st.error(
-        "Ollama is not reachable on 127.0.0.1:11434. Start it with `ollama serve`, "
-        "then click **Re-check** in the sidebar."
-    )
-    prompt = None
-
-
-if prompt:
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    with st.chat_message("assistant"):
-        status = st.status("Retrieving evidence…", expanded=False)
-        flags_slot = st.empty()
-        response_container = st.empty()
-        full_response = ""
-        trace: Dict[str, Any] = {"hits": [], "latency": 0.0}
-        flags: Dict[str, Any] = {}
-
-        try:
-            hits, latency, query_info = retrieve_evidence(prompt, kb, lane_filter)
-            trace = {"hits": hits, "latency": latency, "query_info": query_info}
-            flags = build_flags(prompt, hits)
-            with flags_slot.container():
-                render_flags(flags, lane_filter)
-
-            if answer_mode == "Evidence rows":
-                full_response = format_evidence_answer(hits)
-                response_container.markdown(full_response)
-                status.update(
-                    label=f"Evidence ready · {len(hits)} hit(s) in {format_seconds(latency)}",
-                    state="complete",
-                    expanded=False,
-                )
-            else:
-                generation_start = time.perf_counter()
-                status.update(
-                    label=f"Evidence ready · {len(hits)} hit(s) in {format_seconds(latency)} · composing answer",
-                    state="running",
-                    expanded=False,
-                )
+    if st.button("Index uploaded files", use_container_width=True):
+        if not uploaded_files:
+            st.warning("Choose at least one file first.")
+        else:
+            for uploaded_file in uploaded_files:
+                data = uploaded_file.getvalue()
+                suffix = Path(uploaded_file.name).suffix
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
+                    handle.write(data)
+                    temp_path = Path(handle.name)
                 try:
-                    for chunk in stream_llm_answer(
-                        prompt,
-                        hits,
-                        kb.auto_context_model,
-                        safety_topic=flags.get("safety_topic"),
-                        retrieval_is_low_confidence=flags.get("low_confidence", False),
-                    ):
-                        full_response += chunk
-                        response_container.markdown(full_response + "▌")
-                    full_response = clean_llm_answer(
-                        full_response,
-                        format_evidence_packet(prompt, hits),
-                    )
-                    response_container.markdown(full_response)
-                    generation_seconds = time.perf_counter() - generation_start
-                    trace["generation_seconds"] = generation_seconds
-                    status.update(
-                        label=(
-                            f"Answer ready · {len(hits)} hit(s) in {format_seconds(latency)} · "
-                            f"LLM {format_seconds(generation_seconds)}"
-                        ),
-                        state="complete",
-                        expanded=False,
-                    )
-                except Exception as llm_exc:
-                    full_response = format_evidence_answer(hits)
-                    response_container.markdown(full_response)
-                    status.update(
-                        label=f"LLM failed, showing evidence rows: {llm_exc}",
-                        state="error",
-                        expanded=True,
-                    )
-        except Exception as exc:
-            full_response = (
-                "The local model service returned an error. "
-                "Confirm Ollama is running and the required local models are installed."
+                    count, message = ingest_path(temp_path, uploaded_signature(data), force=True)
+                    st.success(f"{uploaded_file.name}: {message}, {count} chunks")
+                except Exception as exc:
+                    st.error(f"{uploaded_file.name}: {exc}")
+                finally:
+                    temp_path.unlink(missing_ok=True)
+
+    st.header("Database")
+    st.metric("Stored chunks", collection_count(get_collection()))
+    if st.button("Reset Chroma index", use_container_width=True):
+        reset_collection()
+        st.success("Chroma index reset. Re-index the manual to query again.")
+
+left, right = st.columns([1.05, 1], gap="large")
+
+with left:
+    st.subheader("📥 Ingestion pipeline")
+    st.markdown(
+        """
+        1. **Semantic sectioning:** preserve source, page, and detected heading.
+        2. **AutoContext-style prefix:** prepend source/page/section before embedding.
+        3. **Chunking & embedding:** store deterministic local vectors in ChromaDB.
+        """
+    )
+
+    st.subheader("🔎 Query & retrieval")
+    query = st.text_area(
+        "Scientist / operator prompt",
+        placeholder="Example: What phone number is listed for the Undulator beamline?",
+        height=100,
+    )
+    top_k = st.slider("Top-K chunks", 3, 12, 8)
+
+    if st.button("Search IVU Manual", type="primary", use_container_width=True):
+        if not query.strip():
+            st.warning("Enter a query first.")
+        else:
+            rows = query_manual(query, n_results=top_k)
+            if not rows:
+                st.error("No indexed chunks found. Click 'Index IVU manual' first.")
+            else:
+                merged = merge_adjacent_segments(rows)
+                answer_sentences = build_extractive_answer(query, merged or rows)
+                st.session_state["last_rows"] = rows
+                st.session_state["last_merged"] = merged
+                st.session_state["last_answer"] = answer_sentences
+
+    if st.button("Run graded offline checks", use_container_width=True):
+        if collection_count(get_collection()) == 0:
+            st.error("Index the IVU manual before running graded checks.")
+        else:
+            st.session_state["eval_rows"] = evaluate_retrieval()
+
+with right:
+    st.subheader("📊 Retrieval score")
+    rows = st.session_state.get("last_rows", [])
+    answer = st.session_state.get("last_answer", [])
+    if rows:
+        top_score = rows[0]["score"]
+        confidence = "High" if top_score >= 0.55 else "Medium" if top_score >= 0.35 else "Needs review"
+        st.metric("Top relevance", f"{top_score:.2f}", confidence)
+        st.progress(min(top_score, 1.0))
+
+        st.markdown("### Extractive answer draft")
+        if answer:
+            for sentence in answer:
+                st.write(f"- {sentence}")
+        else:
+            st.warning("No strong sentence-level extraction found. Review the source passages below.")
+
+        st.markdown("### Source passages")
+        for index, row in enumerate(rows, start=1):
+            meta = row["metadata"]
+            label = (
+                f"{index}. score {row['score']:.2f} — {meta.get('source', 'source')}, "
+                f"page {meta.get('page', '?')}, {meta.get('section', 'section')}"
             )
-            status.update(label=f"Retrieval failed: {exc}", state="error", expanded=True)
-            st.session_state.ollama_online = kb.embedding_model.is_available()
+            with st.expander(label, expanded=index <= 2):
+                st.text(row["document"])
+    else:
+        st.info("Index the IVU manual, then run a search to see scored source passages.")
 
-        response_container.markdown(full_response)
-        render_retrieval_trace(trace)
+eval_rows = st.session_state.get("eval_rows", [])
+if eval_rows:
+    st.divider()
+    st.subheader("🧪 Graded offline query checks")
+    st.dataframe(eval_rows, use_container_width=True, hide_index=True)
 
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": full_response,
-        "trace": trace,
-        "flags": flags,
-        "lane": lane_filter,
-        "mode": answer_mode,
-    })
+st.divider()
+st.caption(
+    "Why ChromaDB: persistent local vectors, tiny single-node setup, Python-native API, no server required, "
+    "and good fit for data-sovereign CLS manual retrieval. No dsrag package is imported."
+)

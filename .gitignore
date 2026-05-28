@@ -15,6 +15,7 @@ env/
 # ─── Local indices and binary state ────────────────────────────────────────
 # ChromaDB persistent stores. Names follow `<kb_id>_chroma_db/`.
 *_chroma_db/
+chroma_store/
 chroma.sqlite3
 *.parquet
 
