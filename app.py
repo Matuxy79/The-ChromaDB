@@ -1,32 +1,57 @@
 from __future__ import annotations
 
 import hashlib
-import math
-import os
 import re
 import tempfile
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import chromadb
 import fitz
 import streamlit as st
+
+from ragandcag.llm import OllamaAPI
+from examples.cls_cag_cache import SemanticEvidenceCache
+from examples.cls_dllm import (
+    needs_correction,
+    parse_bullets,
+    stream_correction,
+    validate_correction,
+)
+from examples.cls_pipeline import (
+    EMBED_DIM,
+    HashEmbedder,
+    collection_count,
+    instant_answer,
+    retrieve,
+)
+from examples.cls_spectrum import (
+    SUGGESTED_PROBLEMS,
+    category_meta,
+    classify_query,
+    decorate,
+    glow_css,
+)
 
 
 APP_ROOT = Path(__file__).resolve().parent
 MANUAL_DIR = APP_ROOT / "Training for perfect in ui graded"
 DEFAULT_MANUAL = MANUAL_DIR / "IVU beamline manual - Apr 10 2026.pdf"
 CHROMA_DIR = APP_ROOT / "chroma_store"
-COLLECTION_NAME = "cls_ivu_manual_hash_v1"
-EMBED_DIM = 512
+COLLECTION_NAME = "cls_ivu_manual_hash_v1"           # Evidence Store
+CACHE_COLLECTION_NAME = "cls_cag_evidence_cache_v1"  # CAG Layer
 CHUNK_TARGET_CHARS = 1100
 CHUNK_OVERLAP_CHARS = 180
 
+APP_VERSION = "v0.6"
+# Architecture: ONE active model — the embedding Retrieval Encoder. The answer is instant
+# clean parsed text from the RAG/CAG dual layer (DocuSearch-style); the LLM does no text
+# augmentation by default. A single optional LLM stays wired in but OFF unless toggled on.
+DLLM_MODEL = "llama3.2:3b"
+
 
 st.set_page_config(
-    page_title="CLS IVU Manual Query Prototype",
+    page_title=f"CLS IVU Manual Query · {APP_VERSION}",
     page_icon="🔬",
     layout="wide",
 )
@@ -37,33 +62,6 @@ class Chunk:
     text: str
     metadata: dict
     chunk_id: str
-
-
-class HashEmbedder:
-    """Small deterministic embedding model for offline technical-manual retrieval."""
-
-    def __init__(self, dimensions: int = EMBED_DIM) -> None:
-        self.dimensions = dimensions
-
-    def embed(self, texts: Iterable[str]) -> list[list[float]]:
-        return [self._embed_one(text) for text in texts]
-
-    def _embed_one(self, text: str) -> list[float]:
-        tokens = re.findall(r"[a-zA-Z0-9][a-zA-Z0-9_\-/\.]*", text.lower())
-        features: Counter[str] = Counter(tokens)
-        features.update(f"{a} {b}" for a, b in zip(tokens, tokens[1:]))
-
-        vector = [0.0] * self.dimensions
-        for feature, count in features.items():
-            digest = hashlib.blake2b(feature.encode("utf-8"), digest_size=8).digest()
-            bucket = int.from_bytes(digest[:4], "little") % self.dimensions
-            sign = 1.0 if digest[4] % 2 == 0 else -1.0
-            vector[bucket] += sign * (1.0 + math.log(count))
-
-        norm = math.sqrt(sum(value * value for value in vector))
-        if norm == 0:
-            return vector
-        return [value / norm for value in vector]
 
 
 @st.cache_resource(show_spinner=False)
@@ -86,6 +84,24 @@ def get_collection() -> chromadb.Collection:
             "hnsw:space": "cosine",
         },
     )
+
+
+@st.cache_resource(show_spinner=False)
+def get_cache_collection() -> chromadb.Collection:
+    """CAG Layer: a separate collection of prior (query -> retrieved evidence) results."""
+    return get_chroma_client().get_or_create_collection(
+        name=CACHE_COLLECTION_NAME,
+        metadata={
+            "description": "CLS CAG semantic evidence cache",
+            "embedding": f"local_hash_{EMBED_DIM}d",
+            "hnsw:space": "cosine",
+        },
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def get_cache() -> SemanticEvidenceCache:
+    return SemanticEvidenceCache(get_cache_collection(), get_embedder())
 
 
 def file_signature(path: Path) -> str:
@@ -210,13 +226,6 @@ def build_chunks(path: Path, source_hash: str) -> list[Chunk]:
     return chunks
 
 
-def collection_count(collection: chromadb.Collection) -> int:
-    try:
-        return collection.count()
-    except Exception:
-        return 0
-
-
 def source_is_indexed(collection: chromadb.Collection, source_hash: str) -> bool:
     result = collection.get(where={"source_hash": source_hash}, limit=1)
     return bool(result.get("ids"))
@@ -252,129 +261,30 @@ def reset_collection() -> None:
     except Exception:
         pass
     get_collection.clear()
+    # The corpus changed, so any cached evidence is now stale.
+    try:
+        get_cache().clear()
+    except Exception:
+        pass
 
 
-def query_manual(query: str, n_results: int = 8) -> list[dict]:
-    collection = get_collection()
-    if collection_count(collection) == 0:
-        return []
-
-    result = collection.query(
-        query_embeddings=get_embedder().embed([query]),
-        n_results=n_results,
-        include=["documents", "metadatas", "distances"],
-    )
-
-    rows: list[dict] = []
-    documents = result.get("documents", [[]])[0]
-    metadatas = result.get("metadatas", [[]])[0]
-    distances = result.get("distances", [[]])[0]
-    for document, metadata, distance in zip(documents, metadatas, distances):
-        score = max(0.0, min(1.0, 1.0 - float(distance)))
-        rows.append({"document": document, "metadata": metadata or {}, "distance": distance, "score": score})
-    return rows
+# --------------------------------------------------------------------------- #
+# Optional dLLM. ONE LLM, wired in but OFF by default — it never augments the
+# displayed text unless the user toggles it on. The instant answer is pure clean
+# parsed text from the RAG/CAG backend (examples/cls_pipeline.py).
+# --------------------------------------------------------------------------- #
 
 
-def lexical_terms(text: str) -> set[str]:
-    stop_words = {
-        "about",
-        "after",
-        "before",
-        "could",
-        "from",
-        "have",
-        "into",
-        "manual",
-        "procedure",
-        "should",
-        "tell",
-        "that",
-        "their",
-        "there",
-        "these",
-        "this",
-        "what",
-        "when",
-        "where",
-        "which",
-        "with",
-        "would",
-    }
-    return {
-        token
-        for token in re.findall(r"[a-zA-Z0-9][a-zA-Z0-9_\-/\.]*", text.lower())
-        if len(token) > 2 and token not in stop_words
-    }
+@st.cache_resource(show_spinner=False)
+def get_dllm() -> OllamaAPI:
+    return OllamaAPI(DLLM_MODEL)
 
 
-def extract_sentences(text: str) -> list[str]:
-    body = re.sub(r"^Source:.*?\nSection:.*?\nPage:.*?\n\n", "", text, flags=re.S)
-    normalized = re.sub(r"\s+", " ", body)
-    return [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", normalized) if sentence.strip()]
-
-
-def build_extractive_answer(query: str, rows: list[dict], max_sentences: int = 5) -> list[str]:
-    terms = lexical_terms(query)
-    candidates: list[tuple[int, float, str, dict]] = []
-    for row in rows[:5]:
-        for sentence in extract_sentences(row["document"]):
-            sentence_terms = lexical_terms(sentence)
-            overlap = len(terms & sentence_terms)
-            if overlap:
-                candidates.append((overlap, row["score"], sentence, row["metadata"]))
-
-    if not candidates:
-        return []
-
-    candidates.sort(key=lambda item: (item[0], item[1], len(item[2])), reverse=True)
-    chosen: list[str] = []
-    seen: set[str] = set()
-    for _, _, sentence, metadata in candidates:
-        clean = sentence.strip()
-        key = clean.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        source = metadata.get("source", "source")
-        page = metadata.get("page", "?")
-        chosen.append(f"{clean} [Source: {source}, page {page}]")
-        if len(chosen) >= max_sentences:
-            break
-    return chosen
-
-
-def merge_adjacent_segments(rows: list[dict]) -> list[dict]:
-    if not rows:
-        return []
-    by_source: dict[str, dict[int, dict]] = {}
-    for row in rows:
-        meta = row["metadata"]
-        by_source.setdefault(meta.get("source_hash", ""), {})[int(meta.get("chunk_index", -1))] = row
-
-    merged: list[dict] = []
-    used: set[tuple[str, int]] = set()
-    for row in rows[:4]:
-        meta = row["metadata"]
-        source_hash = meta.get("source_hash", "")
-        index = int(meta.get("chunk_index", -1))
-        key = (source_hash, index)
-        if key in used:
-            continue
-        neighbors = []
-        for candidate_index in range(index - 1, index + 2):
-            neighbor = by_source.get(source_hash, {}).get(candidate_index)
-            if neighbor:
-                neighbors.append(neighbor)
-                used.add((source_hash, candidate_index))
-        merged.append(
-            {
-                "metadata": meta,
-                "score": max(neighbor["score"] for neighbor in neighbors),
-                "document": "\n\n--- adjacent segment ---\n\n".join(neighbor["document"] for neighbor in neighbors),
-                "parts": len(neighbors),
-            }
-        )
-    return merged
+def ollama_online() -> bool:
+    try:
+        return get_dllm().is_available(timeout=1.0)
+    except Exception:
+        return False
 
 
 EVAL_CASES = [
@@ -400,7 +310,7 @@ EVAL_CASES = [
 def evaluate_retrieval() -> list[dict]:
     evaluations: list[dict] = []
     for case in EVAL_CASES:
-        rows = query_manual(case["question"], n_results=6)
+        rows = retrieve(get_collection(), get_embedder(), case["question"], n_results=6)
         combined = " ".join(row["document"].lower() for row in rows[:3])
         hits = [keyword for keyword in case["keywords"] if keyword.lower() in combined]
         keyword_score = len(hits) / len(case["keywords"])
@@ -417,9 +327,215 @@ def evaluate_retrieval() -> list[dict]:
     return evaluations
 
 
-st.title("🔬 CLS IVU Beamline Manual Query")
-st.caption(
-    "Local-first ChromaDB retrieval prototype for offline scientific manual search, extraction, and scoring."
+st.markdown(
+    """
+    <style>
+      :root {
+        --bg: #faf6f2;
+        --panel: #ffffff;
+        --ink: #241a1d;
+        --muted: #6d5b56;
+        --faint: #927d77;
+        --line: #ecddd4;
+        --rose: #ff4d6d;
+        --orange: #ff8a3d;
+        --amber: #ffc24b;
+        --green: #6fd58a;
+        --blue: #6aa9ff;
+      }
+
+      html, body, #root {
+        background: var(--bg) !important;
+        min-height: 100vh !important;
+      }
+      header[data-testid="stHeader"] {
+        background: transparent !important;
+        box-shadow: none !important;
+      }
+      .stAppDeployButton { display: none !important; }
+
+      .stApp {
+        background:
+          radial-gradient(1100px 360px at 0% -8%, rgba(255,138,61,0.10) 0%, rgba(255,138,61,0) 60%),
+          var(--bg);
+        color: var(--ink);
+        min-height: 100vh;
+      }
+      div[data-testid="stAppViewContainer"],
+      section[data-testid="stMain"] {
+        background: transparent !important;
+        min-height: 100vh;
+      }
+      .block-container {
+        max-width: 1280px;
+        padding: 1.35rem 2rem 3rem;
+      }
+      .stApp h1, .stApp h2, .stApp h3, .stApp h4,
+      .stApp p, .stApp li, .stApp label, .stMarkdown,
+      .stCaptionContainer, div[data-testid="stText"] {
+        color: var(--ink) !important;
+      }
+      .stCaptionContainer, .stApp small {
+        color: var(--muted) !important;
+      }
+      .stApp h2, .stApp h3 {
+        letter-spacing: 0;
+        font-weight: 760;
+      }
+      .cls-spectrum-rule {
+        height: 5px; border-radius: 999px; margin: 0.15rem 0 0;
+        background: linear-gradient(90deg,var(--rose),var(--orange),var(--amber),var(--green),var(--blue),#b478ff);
+      }
+      .cls-hero {
+        border-radius: 14px; padding: 1.15rem 1.35rem 1rem; margin-bottom: 1.25rem;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        box-shadow: 0 8px 26px rgba(120,80,60,0.08);
+      }
+      .cls-hero h1 {
+        margin: 0;
+        font-size: clamp(1.45rem, 2vw, 1.85rem);
+        color: var(--ink) !important;
+      }
+      .cls-hero p  {
+        margin: 0.3rem 0 0.7rem;
+        color: var(--muted) !important;
+        font-size: 0.95rem;
+      }
+      .cls-badge {
+        display: inline-flex; align-items: center; gap: 0.4rem;
+        padding: 0.22rem 0.66rem; border-radius: 999px; font-size: 0.82rem; font-weight: 700;
+        color: #3a2a2e; background: color-mix(in srgb, var(--hue) 16%, #ffffff);
+        border: 1px solid color-mix(in srgb, var(--hue) 55%, #ffffff);
+      }
+      .cls-answer {
+        border-radius: 12px; padding: 1.05rem 1.2rem; margin-top: 0.4rem;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-left: 5px solid var(--hue,#ff8a3d);
+        box-shadow: var(--glow, 0 6px 22px rgba(120,80,60,0.10));
+        color: var(--ink); line-height: 1.6;
+      }
+      .cls-answer code { color: #b8541a; background: #fbeee4; padding: 0 0.3em; border-radius: 5px; }
+      .cls-q { color: var(--muted); font-style: italic; font-size: 0.92rem; }
+      div[data-testid="stMetricValue"] { color: var(--ink) !important; }
+      div[data-testid="stMetricDelta"] { color: var(--muted) !important; }
+      .tok { border-radius: 6px; padding: 0 0.28em; font-weight: 600; }
+      .tok-phone  { color: #a8480f; background: #fcebdd; box-shadow: inset 0 0 0 1px rgba(244,120,31,0.40); }
+      .tok-acr    { color: #b3203f; background: #fbe2e7; box-shadow: inset 0 0 0 1px rgba(224,57,92,0.35); }
+      .tok-safety { color: #c01838; text-decoration: underline; text-decoration-color: #ff4d6d; text-underline-offset: 3px; font-weight: 700; }
+      .tok-cite   { color: #8a7a74; font-weight: 500; font-size: 0.9em; }
+      /* DocuSearch-style query-term hit highlight. */
+      .tok-hit    { color: #1f6b38; background: #d6f3df; box-shadow: inset 0 0 0 1px rgba(47,158,87,0.45); }
+      mark.tok-hit { color: #1f6b38; }
+      .cls-snippet {
+        white-space: pre-wrap; word-break: break-word;
+        color: #4a3a3e; font-size: 0.9rem; line-height: 1.5;
+      }
+
+      section[data-testid="stSidebar"] {
+        background: var(--panel) !important;
+        border-right: 1px solid var(--line);
+      }
+      section[data-testid="stSidebar"] * {
+        color: var(--ink) !important;
+      }
+      section[data-testid="stSidebar"] div[data-testid="stMetricValue"] {
+        color: #b3203f !important;
+      }
+      section[data-testid="stSidebar"] code,
+      section[data-testid="stSidebar"] pre {
+        background: #f6efe9 !important;
+        color: #3a2a2e !important;
+        border: 1px solid var(--line);
+        white-space: pre-wrap !important;
+        word-break: break-word !important;
+      }
+
+      .stButton > button,
+      button[data-testid="stBaseButton-secondary"] {
+        border-radius: 10px !important;
+        border: 1px solid var(--line) !important;
+        background: var(--panel) !important;
+        color: var(--ink) !important;
+        box-shadow: 0 2px 8px rgba(120,80,60,0.06);
+        min-height: 2.35rem;
+        transition: border-color 120ms ease, transform 120ms ease, background 120ms ease;
+      }
+      .stButton > button:hover,
+      button[data-testid="stBaseButton-secondary"]:hover {
+        border-color: var(--orange) !important;
+        background: #fff6ef !important;
+        transform: translateY(-1px);
+      }
+      button[data-testid="stBaseButton-primary"] {
+        border: 0 !important;
+        background: linear-gradient(90deg, #ff4d6d 0%, #ff7a45 55%, #ffa516 100%) !important;
+        color: #ffffff !important;
+        font-weight: 800 !important;
+        border-radius: 10px !important;
+        box-shadow: 0 8px 20px rgba(255,122,69,0.30);
+      }
+      button[data-testid="stBaseButton-primary"]:hover {
+        filter: brightness(1.04);
+        transform: translateY(-1px);
+      }
+
+      div[data-testid="stTextArea"] textarea,
+      div[data-testid="stTextInput"] input {
+        background: #ffffff !important;
+        color: var(--ink) !important;
+        border: 1px solid var(--line) !important;
+        border-radius: 10px !important;
+      }
+      div[data-testid="stTextArea"] textarea::placeholder {
+        color: #a8938c !important;
+      }
+      div[data-testid="stSlider"] [role="slider"] {
+        background: var(--orange) !important;
+        border-color: var(--orange) !important;
+      }
+      .stProgress > div > div > div { background: #efe4dc !important; }
+      .stProgress > div > div > div > div {
+        background: linear-gradient(90deg, var(--rose), var(--orange), var(--amber)) !important;
+      }
+      div[data-testid="stAlert"] {
+        background: #fff6ef !important;
+        color: var(--ink) !important;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+      }
+      div[data-testid="stFileUploader"] section {
+        background: #faf4ef !important;
+        border-color: var(--line) !important;
+      }
+      div[data-testid="stExpander"] {
+        border: 1px solid var(--line) !important;
+        border-radius: 10px !important;
+        background: var(--panel) !important;
+      }
+      div[data-testid="stExpander"] * {
+        color: var(--ink) !important;
+      }
+      code, pre {
+        white-space: pre-wrap !important;
+        word-break: break-word !important;
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+online = ollama_online()
+st.markdown(
+    f"""
+    <div class="cls-hero">
+      <h1>🔬 CLS IVU Beamline Manual Query <span style="opacity:0.55;font-size:1rem;">{APP_VERSION}</span></h1>
+      <p>Cited manual answers for IVU operators and beamline staff.</p>
+      <div class="cls-spectrum-rule"></div>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
 with st.sidebar:
@@ -462,45 +578,123 @@ with st.sidebar:
                 finally:
                     temp_path.unlink(missing_ok=True)
 
-    st.header("Database")
-    st.metric("Stored chunks", collection_count(get_collection()))
+    st.header("Evidence Store")
+    st.metric("Indexed chunks", collection_count(get_collection()))
     if st.button("Reset Chroma index", use_container_width=True):
         reset_collection()
-        st.success("Chroma index reset. Re-index the manual to query again.")
+        st.success("Evidence Store reset (CAG cache cleared too). Re-index to query again.")
+
+    st.header("♻ CAG Layer")
+    st.caption("Semantic cache of prior question → retrieved evidence.")
+    cag_enabled = st.toggle("Reuse cached evidence", value=True)
+    min_similarity = st.slider("Min similarity for a cache hit", 0.80, 1.00, 0.97, 0.01)
+    get_cache().distance_max = 1.0 - min_similarity
+    st.metric("Cached queries", get_cache().count())
+    if st.button("Clear answer cache", use_container_width=True):
+        get_cache().clear()
+        st.success("CAG cache cleared.")
+
+    st.header("✎ dLLM (optional)")
+    st.caption("Off by default — the answer is instant clean parsed text with no LLM. Turn on to let "
+               "a single downstream model correct extraction artifacts (it never invents facts).")
+    dllm_enabled = st.toggle(
+        "Enable downstream correction",
+        value=False,
+        disabled=not online,
+        help="Needs Ollama. When on, streams a guarded correction in place; clean answers stay instant.",
+    )
+    if not online:
+        st.caption("Ollama offline — answers are instant parsed text only.")
 
 left, right = st.columns([1.05, 1], gap="large")
 
 with left:
-    st.subheader("📥 Ingestion pipeline")
+    st.subheader("📥 Pipeline")
     st.markdown(
-        """
-        1. **Semantic sectioning:** preserve source, page, and detected heading.
-        2. **AutoContext-style prefix:** prepend source/page/section before embedding.
-        3. **Chunking & embedding:** store deterministic local vectors in ChromaDB.
+        f"""
+        1. **Retrieval Encoder** (HashEmbedder) turns text into vectors — the one active model.
+        2. **CAG Layer** reuses a prior query's evidence when a similar question reappears.
+        3. **Evidence Store** (ChromaDB) returns the closest cited passages on a miss.
+        4. **Clean parse** repairs extraction artifacts deterministically — instant, no LLM.
         """
     )
+    with st.expander("ⓘ How it works"):
+        st.markdown(
+            f"""
+            Like DocuSearch, the answer is **instant**: clean parsed text straight from the
+            RAG/CAG dual layer, with query terms highlighted. The only model in this path is the
+            **embedding Retrieval Encoder**; artifact cleanup (hyphenation breaks, spacing,
+            duplicates) is **deterministic code**, not an LLM.
 
-    st.subheader("🔎 Query & retrieval")
+            A single optional **dLLM** ({DLLM_MODEL}) stays wired in but **off by default** — it
+            never augments the displayed text unless you toggle it on. When on, it streams a
+            *correction* in place and is rejected unless every number and `[Source: …]` citation
+            survives verbatim.
+
+            `question → Retrieval Encoder → CAG / Evidence Store → clean parse → instant answer`
+            """
+        )
+
+    st.subheader("🔎 Ask a problem")
+    st.caption("Pick a starting point, or type your own.")
+
+    # Problem-asking chips: clicking one pre-fills the query (seeds the text_area key
+    # before the widget is created on this run, so no extra rerun is needed).
+    for chip_row in (SUGGESTED_PROBLEMS[:3], SUGGESTED_PROBLEMS[3:]):
+        cols = st.columns(len(chip_row))
+        for col, (chip_cat, chip_text) in zip(cols, chip_row):
+            glyph = category_meta(chip_cat)["glyph"]
+            if col.button(f"{glyph} {chip_text}", key=f"chip_{chip_text}", use_container_width=True):
+                st.session_state["query_text"] = chip_text
+
     query = st.text_area(
         "Scientist / operator prompt",
         placeholder="Example: What phone number is listed for the Undulator beamline?",
         height=100,
+        key="query_text",
     )
+
+    # Live category badge — reclassifies on each run (chip click / submit), not per keystroke.
+    live_cat = classify_query(query)
+    live_meta = category_meta(live_cat)
+    st.markdown(
+        f'<span class="cls-badge" style="--hue:{live_meta["hue"]}">'
+        f'{live_meta["glyph"]} {live_meta["label"]}</span>',
+        unsafe_allow_html=True,
+    )
+
     top_k = st.slider("Top-K chunks", 3, 12, 8)
 
     if st.button("Search IVU Manual", type="primary", use_container_width=True):
         if not query.strip():
             st.warning("Enter a query first.")
         else:
-            rows = query_manual(query, n_results=top_k)
-            if not rows:
+            # System 2: the RAG+CAG backend returns the instant clean parsed answer.
+            result = instant_answer(
+                query,
+                collection=get_collection(),
+                cache=get_cache(),
+                embedder=get_embedder(),
+                top_k=top_k,
+                cache_enabled=cag_enabled,
+            )
+            if not result["rows"]:
                 st.error("No indexed chunks found. Click 'Index IVU manual' first.")
             else:
-                merged = merge_adjacent_segments(rows)
-                answer_sentences = build_extractive_answer(query, merged or rows)
-                st.session_state["last_rows"] = rows
-                st.session_state["last_merged"] = merged
-                st.session_state["last_answer"] = answer_sentences
+                st.session_state["last_query"] = query.strip()
+                st.session_state["last_category"] = result["category"]
+                st.session_state["last_rows"] = result["rows"]
+                st.session_state["last_answer"] = result["answer"]
+                st.session_state["last_from_cache"] = result["from_cache"]
+                st.session_state["last_similarity"] = result["similarity"]
+                # dLLM is off by default and never touches text unless toggled on. If on,
+                # arm it only when the instant text shows artifacts worth correcting.
+                activate, reason = needs_correction(result["answer"])
+                st.session_state["last_dllm"] = {
+                    "status": "pending" if (activate and result["answer"]) else "dormant",
+                    "reason": reason,
+                    "text": None,
+                }
 
     if st.button("Run graded offline checks", use_container_width=True):
         if collection_count(get_collection()) == 0:
@@ -509,31 +703,99 @@ with left:
             st.session_state["eval_rows"] = evaluate_retrieval()
 
 with right:
-    st.subheader("📊 Retrieval score")
     rows = st.session_state.get("last_rows", [])
     answer = st.session_state.get("last_answer", [])
     if rows:
         top_score = rows[0]["score"]
-        confidence = "High" if top_score >= 0.55 else "Medium" if top_score >= 0.35 else "Needs review"
-        st.metric("Top relevance", f"{top_score:.2f}", confidence)
-        st.progress(min(top_score, 1.0))
 
-        st.markdown("### Extractive answer draft")
+        # Spectral framing: question type picks the hue (the trustworthy signal); the
+        # hash embedder's absolute cosine score isn't a calibrated relevance, so it is
+        # not shown — it only sets the answer card's glow intensity.
+        category = st.session_state.get("last_category", "general")
+        meta = category_meta(category)
+        hue = meta["hue"]
+        glow = glow_css(hue, top_score)
+        card_open = f'<div class="cls-answer" style="--hue:{hue};--glow:{glow}">'
+
+        # CAG provenance: did this evidence come from the cache or a fresh search?
+        from_cache = st.session_state.get("last_from_cache", False)
+        similarity = st.session_state.get("last_similarity")
+        if from_cache:
+            sim_txt = f"{similarity:.2f}" if similarity is not None else "—"
+            cag_badge = (
+                '<span class="cls-badge" style="--hue:#6fd58a">'
+                f'♻ CAG hit · similarity {sim_txt}</span>'
+            )
+        else:
+            cag_badge = '<span class="cls-q">↯ fresh retrieval</span>'
+
+        st.markdown("### ✨ Answer")
+        st.markdown(
+            f'Question type · <span class="cls-badge" style="--hue:{hue}">'
+            f'{meta["glyph"]} {meta["label"]}</span> &nbsp; {cag_badge}',
+            unsafe_allow_html=True,
+        )
+
+        stored_query = st.session_state.get("last_query", "")
+
+        def card(sentences: list[str]) -> str:
+            body = "<br>".join(f"• {decorate(s, category, stored_query)}" for s in sentences)
+            return f"{card_open}{body}</div>"
+
         if answer:
-            for sentence in answer:
-                st.write(f"- {sentence}")
+            dllm = st.session_state.get("last_dllm", {"status": "dormant"})
+            placeholder = st.empty()
+
+            if dllm.get("status") == "corrected" and dllm.get("text"):
+                # Settled from a prior run — render directly, no flash, no model call.
+                placeholder.markdown(card(dllm["text"]), unsafe_allow_html=True)
+                st.caption(f"✎ dLLM corrected — {dllm.get('reason')}.")
+            elif dllm.get("status") == "pending" and online and dllm_enabled:
+                # Instant text appears first; the dLLM then streams its correction *in place*
+                # into the same card. Re-checked for grounding at the end; reverts on drift.
+                placeholder.markdown(card(answer), unsafe_allow_html=True)
+                buffer = ""
+                try:
+                    for chunk in stream_correction(get_dllm(), answer):
+                        buffer += chunk
+                        placeholder.markdown(
+                            f"{card_open}{decorate(buffer, category, stored_query)}</div>",
+                            unsafe_allow_html=True,
+                        )
+                    corrected = parse_bullets(buffer)
+                    if corrected and validate_correction(" ".join(corrected), answer):
+                        placeholder.markdown(card(corrected), unsafe_allow_html=True)
+                        st.session_state["last_dllm"] = {
+                            "status": "corrected", "reason": dllm.get("reason"), "text": corrected
+                        }
+                        st.caption(f"✎ dLLM corrected — {dllm.get('reason')}.")
+                    else:
+                        placeholder.markdown(card(answer), unsafe_allow_html=True)
+                        st.session_state["last_dllm"] = {"status": "reverted", "reason": dllm.get("reason"), "text": None}
+                        st.caption("⚡ instant — dLLM drifted, kept the grounded extraction.")
+                except Exception:
+                    placeholder.markdown(card(answer), unsafe_allow_html=True)
+                    st.session_state["last_dllm"] = {"status": "reverted", "reason": dllm.get("reason"), "text": None}
+                    st.caption("⚡ instant — dLLM unavailable, kept the grounded extraction.")
+            else:
+                placeholder.markdown(card(answer), unsafe_allow_html=True)
+                st.caption("⚡ instant — clean parsed text from RAG/CAG, no LLM.")
         else:
             st.warning("No strong sentence-level extraction found. Review the source passages below.")
 
         st.markdown("### Source passages")
+        hit_terms = stored_query
         for index, row in enumerate(rows, start=1):
             meta = row["metadata"]
             label = (
-                f"{index}. score {row['score']:.2f} — {meta.get('source', 'source')}, "
-                f"page {meta.get('page', '?')}, {meta.get('section', 'section')}"
+                f"{index}. {meta.get('source', 'source')}, "
+                f"page {meta.get('page', '?')} — {meta.get('section', 'section')}"
             )
             with st.expander(label, expanded=index <= 2):
-                st.text(row["document"])
+                st.markdown(
+                    f'<div class="cls-snippet">{decorate(row["document"], category, hit_terms)}</div>',
+                    unsafe_allow_html=True,
+                )
     else:
         st.info("Index the IVU manual, then run a search to see scored source passages.")
 
@@ -545,6 +807,9 @@ if eval_rows:
 
 st.divider()
 st.caption(
-    "Why ChromaDB: persistent local vectors, tiny single-node setup, Python-native API, no server required, "
-    "and good fit for data-sovereign CLS manual retrieval. No dsrag package is imported."
+    f"{APP_VERSION} · DocuSearch-style: the answer is **instant clean parsed text** from the RAG/CAG "
+    "dual layer — **Retrieval Encoder** (HashEmbedder, the one active model) → **CAG Layer** / "
+    "**Evidence Store** (ChromaDB) → deterministic clean-parse + highlighting. **No LLM augments the "
+    f"text by default**; a single optional **dLLM** ({DLLM_MODEL}) stays wired in but OFF unless toggled, "
+    "and even then only corrects artifacts (never invents facts). Fully offline-capable; no dsrag import."
 )
