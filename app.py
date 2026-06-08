@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import re
 import tempfile
 from dataclasses import dataclass
@@ -43,7 +44,41 @@ CACHE_COLLECTION_NAME = "cls_cag_evidence_cache_v1"  # CAG Layer
 CHUNK_TARGET_CHARS = 1100
 CHUNK_OVERLAP_CHARS = 180
 
-APP_VERSION = "v0.6"
+APP_VERSION = "v0.8"
+
+# --------------------------------------------------------------------------- #
+# Role tiers. The left sidebar delegates one of four paths; each role reshapes
+# the screen by capability. Corpus lifecycle (indexing/reset) is admin-specific;
+# lower tiers narrow down to a clean ask-and-read surface. This is a visual +
+# permission separation only — it does not change how chunks are embedded.
+# --------------------------------------------------------------------------- #
+ROLES: dict[str, dict] = {
+    "Admin": {
+        "glyph": "🛡",
+        "accent": "#ff4d6d",
+        "tagline": "Full control — corpus lifecycle, tuning, and evaluation.",
+        "caps": {"index", "upload", "reindex", "reset", "tune", "cag_tune", "dllm", "eval"},
+    },
+    "Scientist": {
+        "glyph": "🔬",
+        "accent": "#6aa9ff",
+        "tagline": "Bring your own docs and query with full precision controls.",
+        "caps": {"upload", "reindex", "tune", "cag_tune", "dllm", "eval"},
+    },
+    "Staff": {
+        "glyph": "🛠",
+        "accent": "#ffb347",
+        "tagline": "Ask the manual and see what's indexed. Read-only corpus.",
+        "caps": {"cag_toggle"},
+    },
+    "User": {
+        "glyph": "👤",
+        "accent": "#6fd58a",
+        "tagline": "Just ask a problem and read the cited answer.",
+        "caps": set(),
+    },
+}
+ROLE_NAMES = list(ROLES)
 # Architecture: ONE active model — the embedding Retrieval Encoder. The answer is instant
 # clean parsed text from the RAG/CAG dual layer (DocuSearch-style); the LLM does no text
 # augmentation by default. A single optional LLM stays wired in but OFF unless toggled on.
@@ -268,6 +303,65 @@ def reset_collection() -> None:
         pass
 
 
+def evidence_breakdown(collection: chromadb.Collection) -> list[dict]:
+    """Per-document view of the Evidence Store: chunk count and page span by source."""
+    try:
+        existing = collection.get(include=["metadatas"])
+    except Exception:
+        return []
+    by_source: dict[str, dict] = {}
+    for meta in existing.get("metadatas", []) or []:
+        meta = meta or {}
+        source = meta.get("source", "unknown")
+        entry = by_source.setdefault(source, {"source": source, "chunks": 0, "pages": set()})
+        entry["chunks"] += 1
+        page = meta.get("page")
+        if isinstance(page, int):
+            entry["pages"].add(page)
+    rows: list[dict] = []
+    for entry in by_source.values():
+        pages = entry["pages"]
+        rows.append(
+            {
+                "source": entry["source"],
+                "chunks": entry["chunks"],
+                "page_span": (min(pages), max(pages)) if pages else None,
+            }
+        )
+    rows.sort(key=lambda r: r["chunks"], reverse=True)
+    return rows
+
+
+def render_evidence_store(rows: list[dict]) -> None:
+    """Idle-state panel: visualize what is indexed, one bar per document."""
+    st.markdown("### 📚 Evidence Store")
+    if not rows:
+        st.info("Index the IVU manual, then run a search to see scored source passages.")
+        return
+    total_chunks = sum(r["chunks"] for r in rows)
+    st.caption(f"{len(rows)} document(s) · {total_chunks} indexed chunks — run a search to query them.")
+    top = max(r["chunks"] for r in rows)
+    blocks: list[str] = []
+    for r in rows:
+        pct = max(6, round(100 * r["chunks"] / top))
+        span = r["page_span"]
+        if span and span[0] != span[1]:
+            meta = f"pages {span[0]}–{span[1]}"
+        elif span:
+            meta = f"page {span[0]}"
+        else:
+            meta = ""
+        blocks.append(
+            '<div class="cls-evrow">'
+            '<div class="cls-evhead">'
+            f'<span class="cls-evname">📄 {html.escape(str(r["source"]))}</span>'
+            f'<span class="cls-evcount">{r["chunks"]} chunks</span></div>'
+            f'<div class="cls-evtrack"><div class="cls-evfill" style="width:{pct}%"></div></div>'
+            f'<div class="cls-evmeta">{meta}</div></div>'
+        )
+    st.markdown("".join(blocks), unsafe_allow_html=True)
+
+
 # --------------------------------------------------------------------------- #
 # Optional dLLM. ONE LLM, wired in but OFF by default — it never augments the
 # displayed text unless the user toggles it on. The instant answer is pure clean
@@ -408,6 +502,17 @@ st.markdown(
         color: #3a2a2e; background: color-mix(in srgb, var(--hue) 16%, #ffffff);
         border: 1px solid color-mix(in srgb, var(--hue) 55%, #ffffff);
       }
+      /* Role tier separator — sidebar card + hero chip share the --role accent. */
+      .cls-rolecard {
+        border-radius: 12px; padding: 0.7rem 0.85rem; margin: 0.1rem 0 1rem;
+        background: color-mix(in srgb, var(--role) 12%, #ffffff);
+        border: 1px solid color-mix(in srgb, var(--role) 42%, #ffffff);
+        border-left: 5px solid var(--role);
+      }
+      .cls-rolehead { font-weight: 800; font-size: 1.04rem; color: #2a1d20; }
+      .cls-roletag { font-size: 0.8rem; color: var(--muted); margin-top: 0.18rem; line-height: 1.35; }
+      .cls-rolelock { color: var(--faint); font-size: 0.82rem; margin: 0.1rem 0 0.4rem; }
+
       .cls-answer {
         border-radius: 12px; padding: 1.05rem 1.2rem; margin-top: 0.4rem;
         background: var(--panel);
@@ -432,6 +537,23 @@ st.markdown(
         white-space: pre-wrap; word-break: break-word;
         color: #4a3a3e; font-size: 0.9rem; line-height: 1.5;
       }
+
+      /* Evidence Store visualization — one bar per indexed document. */
+      .cls-evrow { margin: 0.55rem 0 0.75rem; }
+      .cls-evhead {
+        display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem;
+      }
+      .cls-evname { font-weight: 650; color: var(--ink); font-size: 0.92rem; word-break: break-word; }
+      .cls-evcount { color: var(--muted); font-size: 0.82rem; white-space: nowrap; }
+      .cls-evtrack {
+        height: 8px; border-radius: 999px; background: #efe4dc;
+        margin: 0.32rem 0 0.18rem; overflow: hidden;
+      }
+      .cls-evfill {
+        height: 100%; border-radius: 999px;
+        background: linear-gradient(90deg, var(--rose), var(--orange), var(--amber));
+      }
+      .cls-evmeta { color: var(--faint); font-size: 0.78rem; }
 
       section[data-testid="stSidebar"] {
         background: var(--panel) !important;
@@ -527,10 +649,33 @@ st.markdown(
 )
 
 online = ollama_online()
+
+# Resolve the active role before the hero so the chip + accent reflect it on the
+# same run. The sidebar radio (key="role") persists the choice across reruns.
+active_role = st.session_state.get("role", ROLE_NAMES[0])
+if active_role not in ROLES:
+    active_role = ROLE_NAMES[0]
+role_meta = ROLES[active_role]
+role_accent = role_meta["accent"]
+role_caps = role_meta["caps"]
+
+
+def role_can(capability: str) -> bool:
+    return capability in role_caps
+
+
+# Per-run accent so the whole path is visually tinted (sidebar edge + chip).
+st.markdown(
+    f"<style>:root {{ --role: {role_accent}; }}"
+    f"section[data-testid=\"stSidebar\"] {{ border-right: 3px solid {role_accent} !important; }}</style>",
+    unsafe_allow_html=True,
+)
+
 st.markdown(
     f"""
     <div class="cls-hero">
-      <h1>🔬 CLS IVU Beamline Manual Query <span style="opacity:0.55;font-size:1rem;">{APP_VERSION}</span></h1>
+      <h1>🔬 CLS IVU Beamline Manual Query <span style="opacity:0.55;font-size:1rem;">{APP_VERSION}</span>
+        &nbsp;<span class="cls-badge" style="--hue:{role_accent}">{role_meta['glyph']} {active_role}</span></h1>
       <p>Cited manual answers for IVU operators and beamline staff.</p>
       <div class="cls-spectrum-rule"></div>
     </div>
@@ -538,7 +683,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-with st.sidebar:
+def _render_corpus_admin() -> None:
+    """Admin-only path: index the canonical IVU manual."""
     st.header("One-click corpus")
     st.write("Default manual:")
     st.code(str(DEFAULT_MANUAL.relative_to(APP_ROOT)) if DEFAULT_MANUAL.exists() else "Missing IVU PDF")
@@ -554,87 +700,157 @@ with st.sidebar:
         else:
             st.error("The default IVU manual PDF was not found.")
 
+
+def _render_upload_section() -> None:
+    """Admin + Scientist path: add and index their own documents."""
     st.header("Upload more docs")
     uploaded_files = st.file_uploader(
         "Add PDF, TXT, or MD files",
         type=["pdf", "txt", "md"],
         accept_multiple_files=True,
     )
+    if uploaded_files:
+        st.caption(f"📎 {len(uploaded_files)} file(s) ready to index.")
+    reindex_uploads = (
+        st.checkbox(
+            "Re-index files already in the store",
+            value=False,
+            help="Off: files already indexed are skipped (fast for big batches). "
+                 "On: re-embed every file even if its content is unchanged.",
+        )
+        if role_can("reindex")
+        else False
+    )
     if st.button("Index uploaded files", use_container_width=True):
         if not uploaded_files:
             st.warning("Choose at least one file first.")
         else:
-            for uploaded_file in uploaded_files:
+            total = len(uploaded_files)
+            progress = st.progress(0.0, text=f"Indexing 0 / {total}…")
+            tally = {"indexed": 0, "reindexed": 0, "skipped": 0, "empty": 0, "failed": 0}
+            chunks_added = 0
+            details: list[str] = []
+            for position, uploaded_file in enumerate(uploaded_files, start=1):
+                name = uploaded_file.name
+                progress.progress((position - 1) / total, text=f"Indexing {position} / {total} · {name}")
                 data = uploaded_file.getvalue()
-                suffix = Path(uploaded_file.name).suffix
+                suffix = Path(name).suffix
                 with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
                     handle.write(data)
                     temp_path = Path(handle.name)
                 try:
-                    count, message = ingest_path(temp_path, uploaded_signature(data), force=True)
-                    st.success(f"{uploaded_file.name}: {message}, {count} chunks")
+                    count, message = ingest_path(
+                        temp_path, uploaded_signature(data), force=reindex_uploads
+                    )
+                    if message == "already indexed":
+                        tally["skipped"] += 1
+                        details.append(f"⏭ {name} — already indexed")
+                    elif message == "no readable text found":
+                        tally["empty"] += 1
+                        details.append(f"⚠ {name} — no readable text")
+                    else:
+                        tally["reindexed" if reindex_uploads else "indexed"] += 1
+                        chunks_added += count
+                        details.append(f"✓ {name} — {count} chunks")
                 except Exception as exc:
-                    st.error(f"{uploaded_file.name}: {exc}")
+                    tally["failed"] += 1
+                    details.append(f"✗ {name} — {exc}")
                 finally:
                     temp_path.unlink(missing_ok=True)
+                progress.progress(position / total, text=f"Indexed {position} / {total}")
+            progress.empty()
 
-    st.header("Evidence Store")
-    st.metric("Indexed chunks", collection_count(get_collection()))
-    if st.button("Reset Chroma index", use_container_width=True):
-        reset_collection()
-        st.success("Evidence Store reset (CAG cache cleared too). Re-index to query again.")
+            labels = [
+                ("indexed", "indexed"),
+                ("reindexed", "re-indexed"),
+                ("skipped", "skipped"),
+                ("empty", "empty"),
+                ("failed", "failed"),
+            ]
+            parts = [f"{tally[key]} {word}" for key, word in labels if tally[key]]
+            summary = " · ".join(parts) + f" · {chunks_added} chunks added"
+            (st.warning if tally["failed"] else st.success)(summary)
+            with st.expander(f"Per-file detail ({total})", expanded=bool(tally["failed"])):
+                st.markdown("\n".join(f"- {line}" for line in details))
 
-    st.header("♻ CAG Layer")
-    st.caption("Semantic cache of prior question → retrieved evidence.")
-    cag_enabled = st.toggle("Reuse cached evidence", value=True)
-    min_similarity = st.slider("Min similarity for a cache hit", 0.80, 1.00, 0.97, 0.01)
-    get_cache().distance_max = 1.0 - min_similarity
-    st.metric("Cached queries", get_cache().count())
-    if st.button("Clear answer cache", use_container_width=True):
-        get_cache().clear()
-        st.success("CAG cache cleared.")
+# Defaults so every role path has these names defined even when its tier hides
+# the control that would otherwise set them.
+cag_enabled = True
+min_similarity = 0.97
+dllm_enabled = False
 
-    st.header("✎ dLLM (optional)")
-    st.caption("Off by default — the answer is instant clean parsed text with no LLM. Turn on to let "
-               "a single downstream model correct extraction artifacts (it never invents facts).")
-    dllm_enabled = st.toggle(
-        "Enable downstream correction",
-        value=False,
-        disabled=not online,
-        help="Needs Ollama. When on, streams a guarded correction in place; clean answers stay instant.",
+with st.sidebar:
+    st.header("Active path")
+    st.radio(
+        "Role",
+        ROLE_NAMES,
+        key="role",
+        format_func=lambda name: f"{ROLES[name]['glyph']} {name}",
+        label_visibility="collapsed",
     )
-    if not online:
-        st.caption("Ollama offline — answers are instant parsed text only.")
+    st.markdown(
+        f'<div class="cls-rolecard" style="--role:{role_accent}">'
+        f'<div class="cls-rolehead">{role_meta["glyph"]} {active_role}</div>'
+        f'<div class="cls-roletag">{role_meta["tagline"]}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    if role_can("index"):
+        _render_corpus_admin()
+    if role_can("upload"):
+        _render_upload_section()
+
+    # Read-only corpus visibility for every operating tier; the bare User path
+    # stays a pure ask-and-read surface, so it sees no store internals.
+    if active_role != "User":
+        st.header("Evidence Store")
+        store_rows = evidence_breakdown(get_collection())
+        st.metric("Indexed chunks", collection_count(get_collection()))
+        if store_rows:
+            st.caption(f"across {len(store_rows)} document(s)")
+        if role_can("reset") and st.button("Reset Chroma index", use_container_width=True):
+            reset_collection()
+            st.success("Evidence Store reset (CAG cache cleared too). Re-index to query again.")
+
+    if role_can("cag_tune"):
+        st.header("♻ CAG Layer")
+        st.caption("Semantic cache of prior question → retrieved evidence.")
+        cag_enabled = st.toggle("Reuse cached evidence", value=True)
+        min_similarity = st.slider("Min similarity for a cache hit", 0.80, 1.00, 0.97, 0.01)
+        st.metric("Cached queries", get_cache().count())
+        if st.button("Clear answer cache", use_container_width=True):
+            get_cache().clear()
+            st.success("CAG cache cleared.")
+    elif role_can("cag_toggle"):
+        st.header("♻ CAG Layer")
+        st.caption("Reuse evidence from prior identical questions.")
+        cag_enabled = st.toggle("Reuse cached evidence", value=True)
+        st.metric("Cached queries", get_cache().count())
+
+    get_cache().distance_max = 1.0 - min_similarity
+
+    if role_can("dllm"):
+        st.header("✎ dLLM (optional)")
+        st.caption("Off by default — the answer is instant clean parsed text with no LLM. Turn on to let "
+                   "a single downstream model correct extraction artifacts (it never invents facts).")
+        dllm_enabled = st.toggle(
+            "Enable downstream correction",
+            value=False,
+            disabled=not online,
+            help="Needs Ollama. When on, streams a guarded correction in place; clean answers stay instant.",
+        )
+        if not online:
+            st.caption("Ollama offline — answers are instant parsed text only.")
+
+    if not role_can("index") and not role_can("upload"):
+        st.markdown(
+            '<div class="cls-rolelock">📚 Corpus is curated by an administrator.</div>',
+            unsafe_allow_html=True,
+        )
 
 left, right = st.columns([1.05, 1], gap="large")
 
 with left:
-    st.subheader("📥 Pipeline")
-    st.markdown(
-        f"""
-        1. **Retrieval Encoder** (HashEmbedder) turns text into vectors — the one active model.
-        2. **CAG Layer** reuses a prior query's evidence when a similar question reappears.
-        3. **Evidence Store** (ChromaDB) returns the closest cited passages on a miss.
-        4. **Clean parse** repairs extraction artifacts deterministically — instant, no LLM.
-        """
-    )
-    with st.expander("ⓘ How it works"):
-        st.markdown(
-            f"""
-            Like DocuSearch, the answer is **instant**: clean parsed text straight from the
-            RAG/CAG dual layer, with query terms highlighted. The only model in this path is the
-            **embedding Retrieval Encoder**; artifact cleanup (hyphenation breaks, spacing,
-            duplicates) is **deterministic code**, not an LLM.
-
-            A single optional **dLLM** ({DLLM_MODEL}) stays wired in but **off by default** — it
-            never augments the displayed text unless you toggle it on. When on, it streams a
-            *correction* in place and is rejected unless every number and `[Source: …]` citation
-            survives verbatim.
-
-            `question → Retrieval Encoder → CAG / Evidence Store → clean parse → instant answer`
-            """
-        )
-
     st.subheader("🔎 Ask a problem")
     st.caption("Pick a starting point, or type your own.")
 
@@ -650,7 +866,7 @@ with left:
     query = st.text_area(
         "Scientist / operator prompt",
         placeholder="Example: What phone number is listed for the Undulator beamline?",
-        height=100,
+        height=240,
         key="query_text",
     )
 
@@ -663,7 +879,9 @@ with left:
         unsafe_allow_html=True,
     )
 
-    top_k = st.slider("Top-K chunks", 3, 12, 8)
+    # Top-K is a precision knob — only the tuning tiers (Admin / Scientist) see it;
+    # operating tiers (Staff / User) run on a sensible fixed default.
+    top_k = st.slider("Top-K chunks", 3, 12, 8) if role_can("tune") else 8
 
     if st.button("Search IVU Manual", type="primary", use_container_width=True):
         if not query.strip():
@@ -696,7 +914,7 @@ with left:
                     "text": None,
                 }
 
-    if st.button("Run graded offline checks", use_container_width=True):
+    if role_can("eval") and st.button("Run graded offline checks", use_container_width=True):
         if collection_count(get_collection()) == 0:
             st.error("Index the IVU manual before running graded checks.")
         else:
@@ -797,7 +1015,7 @@ with right:
                     unsafe_allow_html=True,
                 )
     else:
-        st.info("Index the IVU manual, then run a search to see scored source passages.")
+        render_evidence_store(evidence_breakdown(get_collection()))
 
 eval_rows = st.session_state.get("eval_rows", [])
 if eval_rows:

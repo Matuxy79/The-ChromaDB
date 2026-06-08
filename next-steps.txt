@@ -1,0 +1,5 @@
+connect the open ai compatable endpoint and just connect a sample model like gpt 20b oss
+
+new diff confluence space
+
+ml flow
