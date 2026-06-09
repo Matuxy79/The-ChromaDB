@@ -7,7 +7,7 @@ returned and the slow evidence-store search is skipped (the formatter still re-r
 the prose stays fresh — we cache retrieval, not generation).
 
 Architecture (names used across the app):
-    Retrieval Encoder (HashEmbedder) -> Evidence Store (ChromaDB) -> Formatting LLM
+    Retrieval Encoder (HashEmbedder) -> Evidence Store (ChromaDB) -> deterministic answer builder
     CAG Layer = this semantic cache of prior (query -> retrieved evidence) results.
 
 Design notes:
@@ -17,7 +17,7 @@ Design notes:
 - Entries are scoped by `corpus_sig` so a re-indexed Evidence Store never serves stale
   evidence. The cache holds JSON-serialised evidence rows in the document field.
 - With the lexical HashEmbedder, matches are reliable for near-identical queries;
-  paraphrase generalisation would need a semantic encoder (nomic-embed-text).
+  paraphrase generalisation would need a semantic encoder.
 """
 
 from __future__ import annotations

@@ -17,4 +17,6 @@ fi
 
 mkdir -p "$ROOT_DIR/docs/inbox" "$ROOT_DIR/docs/processed" "$ROOT_DIR/docs/failed"
 
+printf "[CLS RAG+CAG Indexer] Using HashEmbedder only; no local LLM or embedding model will be pulled.\n"
+
 exec "$VENV_DIR/bin/python" "$ROOT_DIR/ingest_daemon.py" "$@"

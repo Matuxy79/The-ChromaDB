@@ -1,30 +1,42 @@
 from __future__ import annotations
 
-import hashlib
 import html
-import re
+import json
+import os
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
+import urllib.error
+import urllib.request
 
-import chromadb
-import fitz
 import streamlit as st
 
-from ragandcag.llm import OllamaAPI
-from examples.cls_cag_cache import SemanticEvidenceCache
+from cls_config import (
+    APP_ROOT,
+    APP_VERSION,
+    DEFAULT_API_URL,
+    DEFAULT_DLLM_MODEL,
+    DEFAULT_MANUAL,
+)
+from cls_service import (
+    ask_manual,
+    call_dllm_api,
+    collection_count,
+    dllm_status as service_dllm_status,
+    evaluate_retrieval,
+    evidence_breakdown,
+    file_signature,
+    get_cache,
+    get_collection,
+    ingest_path,
+    reset_collection,
+    uploaded_signature,
+)
 from examples.cls_dllm import (
+    CORRECTION_SYSTEM,
+    correction_user,
     needs_correction,
     parse_bullets,
-    stream_correction,
     validate_correction,
-)
-from examples.cls_pipeline import (
-    EMBED_DIM,
-    HashEmbedder,
-    collection_count,
-    instant_answer,
-    retrieve,
 )
 from examples.cls_spectrum import (
     SUGGESTED_PROBLEMS,
@@ -34,17 +46,6 @@ from examples.cls_spectrum import (
     glow_css,
 )
 
-
-APP_ROOT = Path(__file__).resolve().parent
-MANUAL_DIR = APP_ROOT / "Training for perfect in ui graded"
-DEFAULT_MANUAL = MANUAL_DIR / "IVU beamline manual - Apr 10 2026.pdf"
-CHROMA_DIR = APP_ROOT / "chroma_store"
-COLLECTION_NAME = "cls_ivu_manual_hash_v1"           # Evidence Store
-CACHE_COLLECTION_NAME = "cls_cag_evidence_cache_v1"  # CAG Layer
-CHUNK_TARGET_CHARS = 1100
-CHUNK_OVERLAP_CHARS = 180
-
-APP_VERSION = "v0.8"
 
 # --------------------------------------------------------------------------- #
 # Role tiers. The left sidebar delegates one of four paths; each role reshapes
@@ -82,7 +83,7 @@ ROLE_NAMES = list(ROLES)
 # Architecture: ONE active model — the embedding Retrieval Encoder. The answer is instant
 # clean parsed text from the RAG/CAG dual layer (DocuSearch-style); the LLM does no text
 # augmentation by default. A single optional LLM stays wired in but OFF unless toggled on.
-DLLM_MODEL = "llama3.2:3b"
+DLLM_MODEL = DEFAULT_DLLM_MODEL
 
 
 st.set_page_config(
@@ -90,247 +91,6 @@ st.set_page_config(
     page_icon="🔬",
     layout="wide",
 )
-
-
-@dataclass(frozen=True)
-class Chunk:
-    text: str
-    metadata: dict
-    chunk_id: str
-
-
-@st.cache_resource(show_spinner=False)
-def get_embedder() -> HashEmbedder:
-    return HashEmbedder()
-
-
-@st.cache_resource(show_spinner=False)
-def get_chroma_client() -> chromadb.PersistentClient:
-    return chromadb.PersistentClient(path=str(CHROMA_DIR))
-
-
-@st.cache_resource(show_spinner=False)
-def get_collection() -> chromadb.Collection:
-    return get_chroma_client().get_or_create_collection(
-        name=COLLECTION_NAME,
-        metadata={
-            "description": "CLS IVU beamline manual extractive retrieval prototype",
-            "embedding": f"local_hash_{EMBED_DIM}d",
-            "hnsw:space": "cosine",
-        },
-    )
-
-
-@st.cache_resource(show_spinner=False)
-def get_cache_collection() -> chromadb.Collection:
-    """CAG Layer: a separate collection of prior (query -> retrieved evidence) results."""
-    return get_chroma_client().get_or_create_collection(
-        name=CACHE_COLLECTION_NAME,
-        metadata={
-            "description": "CLS CAG semantic evidence cache",
-            "embedding": f"local_hash_{EMBED_DIM}d",
-            "hnsw:space": "cosine",
-        },
-    )
-
-
-@st.cache_resource(show_spinner=False)
-def get_cache() -> SemanticEvidenceCache:
-    return SemanticEvidenceCache(get_cache_collection(), get_embedder())
-
-
-def file_signature(path: Path) -> str:
-    hasher = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            hasher.update(block)
-    return hasher.hexdigest()[:16]
-
-
-def uploaded_signature(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()[:16]
-
-
-def load_pdf(path: Path) -> list[tuple[int, str]]:
-    pages: list[tuple[int, str]] = []
-    with fitz.open(path) as document:
-        for page_index, page in enumerate(document, start=1):
-            text = page.get_text("text").strip()
-            if text:
-                pages.append((page_index, text))
-    return pages
-
-
-def load_text(path: Path) -> list[tuple[int, str]]:
-    text = path.read_text(encoding="utf-8", errors="replace").strip()
-    return [(1, text)] if text else []
-
-
-def load_document(path: Path) -> list[tuple[int, str]]:
-    suffix = path.suffix.lower()
-    if suffix == ".pdf":
-        return load_pdf(path)
-    if suffix in {".txt", ".md"}:
-        return load_text(path)
-    raise ValueError(f"Unsupported file type: {suffix}. Use PDF, TXT, or MD.")
-
-
-def detect_section(text: str, fallback: str) -> str:
-    for line in text.splitlines()[:12]:
-        clean = re.sub(r"\s+", " ", line).strip()
-        if re.match(r"^\d+(\.\d+)*\s+[A-ZA-Za-z]", clean):
-            return clean[:120]
-        if 8 <= len(clean) <= 90 and clean[:1].isupper() and not clean.endswith("."):
-            return clean[:120]
-    return fallback
-
-
-def split_page_text(
-    text: str,
-    page_number: int,
-    source_name: str,
-    source_hash: str,
-    starting_index: int,
-) -> list[Chunk]:
-    section = detect_section(text, f"Page {page_number}")
-    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
-    chunks: list[Chunk] = []
-    buffer = ""
-    chunk_index = starting_index
-
-    def flush() -> None:
-        nonlocal buffer, chunk_index
-        clean = re.sub(r"\n{3,}", "\n\n", buffer).strip()
-        if not clean:
-            return
-        context_text = f"Source: {source_name}\nSection: {section}\nPage: {page_number}\n\n{clean}"
-        chunk_id = f"{source_hash}:{chunk_index:05d}"
-        chunks.append(
-            Chunk(
-                text=context_text,
-                metadata={
-                    "source": source_name,
-                    "source_hash": source_hash,
-                    "page": page_number,
-                    "section": section,
-                    "chunk_index": chunk_index,
-                },
-                chunk_id=chunk_id,
-            )
-        )
-        overlap = clean[-CHUNK_OVERLAP_CHARS:] if len(clean) > CHUNK_OVERLAP_CHARS else clean
-        buffer = overlap
-        chunk_index += 1
-
-    for paragraph in paragraphs:
-        candidate = f"{buffer}\n\n{paragraph}".strip() if buffer else paragraph
-        if len(candidate) > CHUNK_TARGET_CHARS and buffer:
-            flush()
-            buffer = paragraph
-        else:
-            buffer = candidate
-
-        while len(buffer) > CHUNK_TARGET_CHARS * 1.4:
-            cut = buffer.rfind(". ", 0, CHUNK_TARGET_CHARS)
-            if cut < CHUNK_TARGET_CHARS // 2:
-                cut = CHUNK_TARGET_CHARS
-            head, buffer = buffer[: cut + 1], buffer[cut + 1 :]
-            saved_buffer = buffer
-            buffer = head
-            flush()
-            buffer = f"{head[-CHUNK_OVERLAP_CHARS:]}\n\n{saved_buffer}".strip()
-
-    flush()
-    return chunks
-
-
-def build_chunks(path: Path, source_hash: str) -> list[Chunk]:
-    pages = load_document(path)
-    chunks: list[Chunk] = []
-    next_index = 0
-    for page_number, text in pages:
-        page_chunks = split_page_text(
-            text=text,
-            page_number=page_number,
-            source_name=path.name,
-            source_hash=source_hash,
-            starting_index=next_index,
-        )
-        chunks.extend(page_chunks)
-        next_index += len(page_chunks)
-    return chunks
-
-
-def source_is_indexed(collection: chromadb.Collection, source_hash: str) -> bool:
-    result = collection.get(where={"source_hash": source_hash}, limit=1)
-    return bool(result.get("ids"))
-
-
-def ingest_path(path: Path, source_hash: str, force: bool = False) -> tuple[int, str]:
-    collection = get_collection()
-    if source_is_indexed(collection, source_hash):
-        if not force:
-            return 0, "already indexed"
-        existing = collection.get(where={"source_hash": source_hash})
-        if existing.get("ids"):
-            collection.delete(ids=existing["ids"])
-
-    chunks = build_chunks(path, source_hash)
-    if not chunks:
-        return 0, "no readable text found"
-
-    embeddings = get_embedder().embed(chunk.text for chunk in chunks)
-    collection.add(
-        ids=[chunk.chunk_id for chunk in chunks],
-        documents=[chunk.text for chunk in chunks],
-        metadatas=[chunk.metadata for chunk in chunks],
-        embeddings=embeddings,
-    )
-    return len(chunks), "indexed"
-
-
-def reset_collection() -> None:
-    client = get_chroma_client()
-    try:
-        client.delete_collection(COLLECTION_NAME)
-    except Exception:
-        pass
-    get_collection.clear()
-    # The corpus changed, so any cached evidence is now stale.
-    try:
-        get_cache().clear()
-    except Exception:
-        pass
-
-
-def evidence_breakdown(collection: chromadb.Collection) -> list[dict]:
-    """Per-document view of the Evidence Store: chunk count and page span by source."""
-    try:
-        existing = collection.get(include=["metadatas"])
-    except Exception:
-        return []
-    by_source: dict[str, dict] = {}
-    for meta in existing.get("metadatas", []) or []:
-        meta = meta or {}
-        source = meta.get("source", "unknown")
-        entry = by_source.setdefault(source, {"source": source, "chunks": 0, "pages": set()})
-        entry["chunks"] += 1
-        page = meta.get("page")
-        if isinstance(page, int):
-            entry["pages"].add(page)
-    rows: list[dict] = []
-    for entry in by_source.values():
-        pages = entry["pages"]
-        rows.append(
-            {
-                "source": entry["source"],
-                "chunks": entry["chunks"],
-                "page_span": (min(pages), max(pages)) if pages else None,
-            }
-        )
-    rows.sort(key=lambda r: r["chunks"], reverse=True)
-    return rows
-
 
 def render_evidence_store(rows: list[dict]) -> None:
     """Idle-state panel: visualize what is indexed, one bar per document."""
@@ -362,63 +122,92 @@ def render_evidence_store(rows: list[dict]) -> None:
     st.markdown("".join(blocks), unsafe_allow_html=True)
 
 
-# --------------------------------------------------------------------------- #
-# Optional dLLM. ONE LLM, wired in but OFF by default — it never augments the
-# displayed text unless the user toggles it on. The instant answer is pure clean
-# parsed text from the RAG/CAG backend (examples/cls_pipeline.py).
-# --------------------------------------------------------------------------- #
+API_URL = DEFAULT_API_URL.rstrip("/")
+USE_API_BACKEND = os.getenv("CLS_USE_API", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
-@st.cache_resource(show_spinner=False)
-def get_dllm() -> OllamaAPI:
-    return OllamaAPI(DLLM_MODEL)
-
-
-def ollama_online() -> bool:
+def post_json(path: str, payload: dict, timeout: float = 30.0) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{API_URL}{path}",
+        data=data,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
     try:
-        return get_dllm().is_available(timeout=1.0)
-    except Exception:
-        return False
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"API bridge unavailable at {API_URL}: {exc}") from exc
 
 
-EVAL_CASES = [
-    {
-        "question": "Who are the IVU beamline contacts and phone numbers?",
-        "keywords": ["beatriz", "narayan", "al", "3868", "3648", "3530"],
-    },
-    {
-        "question": "What are the emergency contact numbers for fire or ambulance?",
-        "keywords": ["911", "security", "306-966-5555"],
-    },
-    {
-        "question": "What beamline phone number is listed for the Undulator beamline?",
-        "keywords": ["undulator", "soe-3", "3832"],
-    },
-    {
-        "question": "Where does the manual describe the in-vacuum undulator?",
-        "keywords": ["in-vacuum", "undulator"],
-    },
-]
+def get_json(path: str, timeout: float = 2.0) -> dict:
+    request = urllib.request.Request(
+        f"{API_URL}{path}",
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return {}
 
 
-def evaluate_retrieval() -> list[dict]:
-    evaluations: list[dict] = []
-    for case in EVAL_CASES:
-        rows = retrieve(get_collection(), get_embedder(), case["question"], n_results=6)
-        combined = " ".join(row["document"].lower() for row in rows[:3])
-        hits = [keyword for keyword in case["keywords"] if keyword.lower() in combined]
-        keyword_score = len(hits) / len(case["keywords"])
-        top_score = rows[0]["score"] if rows else 0.0
-        evaluations.append(
+def query_backend(query: str, top_k: int, cache_enabled: bool, min_similarity: float) -> dict:
+    if USE_API_BACKEND:
+        return post_json(
+            "/v1/query",
             {
-                "question": case["question"],
-                "keyword_score": keyword_score,
-                "top_relevance": top_score,
-                "hits": ", ".join(hits) if hits else "none",
-                "status": "pass" if keyword_score >= 0.5 else "review",
-            }
+                "query": query,
+                "top_k": top_k,
+                "cache_enabled": cache_enabled,
+                "min_similarity": min_similarity,
+            },
         )
-    return evaluations
+    return ask_manual(
+        query,
+        top_k=top_k,
+        cache_enabled=cache_enabled,
+        min_similarity=min_similarity,
+    )
+
+
+def dllm_api_status() -> dict:
+    if not USE_API_BACKEND:
+        return service_dllm_status()
+    status = get_json("/v1/dllm/status")
+    if status:
+        return status
+    return {
+        "provider": "api",
+        "base_url": API_URL,
+        "model": DLLM_MODEL,
+        "configured": False,
+        "online": False,
+        "detail": f"Start the dLLM API bridge at {API_URL}, or leave correction off.",
+    }
+
+
+def correct_with_dllm_api(sentences: list[str]) -> list[str]:
+    if not USE_API_BACKEND:
+        return parse_bullets(
+            call_dllm_api(
+                [{"role": "user", "content": correction_user(sentences)}],
+                system=CORRECTION_SYSTEM,
+                model=DLLM_MODEL,
+            )
+        )
+    response = post_json(
+        "/v1/dllm/chat",
+        {
+            "model": DLLM_MODEL,
+            "system": CORRECTION_SYSTEM,
+            "messages": [{"role": "user", "content": correction_user(sentences)}],
+        },
+        timeout=60.0,
+    )
+    return parse_bullets(response.get("content", ""))
 
 
 st.markdown(
@@ -648,7 +437,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-online = ollama_online()
+dllm_endpoint = dllm_api_status()
+dllm_api_online = bool(dllm_endpoint.get("online"))
 
 # Resolve the active role before the hero so the chip + accent reflect it on the
 # same run. The sidebar radio (key="role") persists the choice across reruns.
@@ -794,6 +584,12 @@ with st.sidebar:
         f'<div class="cls-roletag">{role_meta["tagline"]}</div></div>',
         unsafe_allow_html=True,
     )
+    st.header("Frontend bridge")
+    st.caption(f"Streamlit → {'FastAPI' if USE_API_BACKEND else 'embedded service'}")
+    st.code(f"{API_URL}/v1/query\n{API_URL}/v1/chat/completions\n{API_URL}/v1/dllm/status", language="text")
+    dllm_state = "online" if dllm_api_online else "offline"
+    dllm_config = "configured" if dllm_endpoint.get("configured") else "not configured"
+    st.caption(f"dLLM API {dllm_state} · {dllm_endpoint.get('model', DLLM_MODEL)} · {dllm_config}")
 
     if role_can("index"):
         _render_corpus_admin()
@@ -830,17 +626,17 @@ with st.sidebar:
     get_cache().distance_max = 1.0 - min_similarity
 
     if role_can("dllm"):
-        st.header("✎ dLLM (optional)")
+        st.header("✎ dLLM API")
         st.caption("Off by default — the answer is instant clean parsed text with no LLM. Turn on to let "
-                   "a single downstream model correct extraction artifacts (it never invents facts).")
+                   f"the {DLLM_MODEL} API connection correct extraction artifacts (it never invents facts).")
         dllm_enabled = st.toggle(
-            "Enable downstream correction",
+            "Enable dLLM API correction",
             value=False,
-            disabled=not online,
-            help="Needs Ollama. When on, streams a guarded correction in place; clean answers stay instant.",
+            disabled=not dllm_api_online,
+            help="Needs the configured dLLM API model online. When on, applies a guarded correction in place.",
         )
-        if not online:
-            st.caption("Ollama offline — answers are instant parsed text only.")
+        if not dllm_api_online:
+            st.caption(dllm_endpoint.get("detail", "dLLM API offline — answers are instant parsed text only."))
 
     if not role_can("index") and not role_can("upload"):
         st.markdown(
@@ -888,15 +684,14 @@ with left:
             st.warning("Enter a query first.")
         else:
             # System 2: the RAG+CAG backend returns the instant clean parsed answer.
-            result = instant_answer(
-                query,
-                collection=get_collection(),
-                cache=get_cache(),
-                embedder=get_embedder(),
-                top_k=top_k,
-                cache_enabled=cag_enabled,
-            )
-            if not result["rows"]:
+            try:
+                result = query_backend(query, top_k, cag_enabled, min_similarity)
+            except RuntimeError as exc:
+                st.error(str(exc))
+                result = None
+            if result is None:
+                pass
+            elif not result["rows"]:
                 st.error("No indexed chunks found. Click 'Index IVU manual' first.")
             else:
                 st.session_state["last_query"] = query.strip()
@@ -968,19 +763,12 @@ with right:
                 # Settled from a prior run — render directly, no flash, no model call.
                 placeholder.markdown(card(dllm["text"]), unsafe_allow_html=True)
                 st.caption(f"✎ dLLM corrected — {dllm.get('reason')}.")
-            elif dllm.get("status") == "pending" and online and dllm_enabled:
-                # Instant text appears first; the dLLM then streams its correction *in place*
-                # into the same card. Re-checked for grounding at the end; reverts on drift.
+            elif dllm.get("status") == "pending" and dllm_api_online and dllm_enabled:
+                # Instant text appears first; the dLLM API then corrects it in place.
+                # Re-checked for grounding at the end; reverts on drift.
                 placeholder.markdown(card(answer), unsafe_allow_html=True)
-                buffer = ""
                 try:
-                    for chunk in stream_correction(get_dllm(), answer):
-                        buffer += chunk
-                        placeholder.markdown(
-                            f"{card_open}{decorate(buffer, category, stored_query)}</div>",
-                            unsafe_allow_html=True,
-                        )
-                    corrected = parse_bullets(buffer)
+                    corrected = correct_with_dllm_api(answer)
                     if corrected and validate_correction(" ".join(corrected), answer):
                         placeholder.markdown(card(corrected), unsafe_allow_html=True)
                         st.session_state["last_dllm"] = {
@@ -1028,6 +816,6 @@ st.caption(
     f"{APP_VERSION} · DocuSearch-style: the answer is **instant clean parsed text** from the RAG/CAG "
     "dual layer — **Retrieval Encoder** (HashEmbedder, the one active model) → **CAG Layer** / "
     "**Evidence Store** (ChromaDB) → deterministic clean-parse + highlighting. **No LLM augments the "
-    f"text by default**; a single optional **dLLM** ({DLLM_MODEL}) stays wired in but OFF unless toggled, "
+    f"text by default**; the optional **dLLM API** ({DLLM_MODEL}) stays wired in but OFF unless toggled, "
     "and even then only corrects artifacts (never invents facts). Fully offline-capable; no dsrag import."
 )

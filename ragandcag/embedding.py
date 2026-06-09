@@ -3,14 +3,23 @@ from typing import Callable, List, Optional
 import urllib.error
 import urllib.request
 
-from langchain_ollama import OllamaEmbeddings
-
 
 OLLAMA_TAGS_URL = "http://127.0.0.1:11434/api/tags"
 
 
 class OllamaEmbedding:
-    def __init__(self, model: str = "nomic-embed-text", dimension: int = 768):
+    def __init__(self, model: str | None = None, dimension: int = 768):
+        if not model:
+            raise RuntimeError(
+                "OllamaEmbedding is an optional legacy adapter. Pass a model name explicitly; "
+                "the v0.9 app uses HashEmbedder and never pulls local embedding models."
+            )
+        try:
+            from langchain_ollama import OllamaEmbeddings
+        except ImportError as exc:
+            raise RuntimeError(
+                "OllamaEmbedding requires the optional langchain-ollama package."
+            ) from exc
         self.model = model
         self.dimension = dimension
         self.client = OllamaEmbeddings(model=model)

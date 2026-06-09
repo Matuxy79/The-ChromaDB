@@ -50,8 +50,8 @@ SAFETY_TOPICS: Dict[str, List[str]] = {
 
 
 # Distance threshold above which retrieval is considered low-confidence.
-# nomic-embed-text + Chroma cosine distance: empirically ~0.30–0.40 for solid
-# matches on the IVU manual. >0.55 means the top hit is a stretch.
+# Chroma cosine distance >0.55 usually means the top hit is a stretch for this
+# prototype's retrieval traces.
 LOW_CONFIDENCE_DISTANCE = 0.55
 
 

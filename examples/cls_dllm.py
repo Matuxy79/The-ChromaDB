@@ -11,7 +11,7 @@ summarises, or introduces facts, and every number and citation is preserved.
 This module is pure-Python and side-effect-free:
 - `needs_correction(sentences)` is the sparse activation gate (returns False for clean text).
 - `CORRECTION_SYSTEM` / `correction_user(...)` build the constrained correction prompt; the
-  app runs the actual one-shot Ollama call and re-checks groundedness.
+  app/API runs the actual one-shot dLLM API call and re-checks groundedness.
 """
 
 from __future__ import annotations
@@ -87,20 +87,13 @@ def correction_user(sentences: Iterable[str]) -> str:
     return f"Correct the mechanical artifacts in these bullets:\n{bullets}"
 
 
-# --- Streaming correction + trust guards ------------------------------------------------ #
-# The dLLM streams live into the UI; these helpers let the UI accept the result only if it
-# stayed faithful. A weak model invents numbers and mangles citations, so both are checked.
-
-def stream_correction(api, sentences: list[str]) -> Iterable[str]:
-    """Yield the correction token-by-token. `api` is any object with `.stream(messages, system)`."""
-    yield from api.stream(
-        [{"role": "user", "content": correction_user(sentences)}],
-        system=CORRECTION_SYSTEM,
-    )
+# --- Correction parsing + trust guards -------------------------------------------------- #
+# The dLLM API result is accepted only if it stayed faithful. Weak models can invent
+# numbers or mangle citations, so both are checked before the UI shows a correction.
 
 
 def parse_bullets(raw: str) -> list[str]:
-    """Strip bullet markers and blank lines from streamed/one-shot model output."""
+    """Strip bullet markers and blank lines from model output."""
     lines = [re.sub(r"^[-*•]\s*", "", line).strip() for line in raw.splitlines()]
     return [line for line in lines if line]
 

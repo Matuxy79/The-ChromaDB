@@ -6,7 +6,6 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$ROOT_DIR/.venv"
 PYTHON_CMD="${PYTHON_CMD:-python3}"
 PORT="${STREAMLIT_PORT:-8501}"
-OLLAMA_LOG="$ROOT_DIR/ollama.log"
 REQUIREMENTS_MARKER="$VENV_DIR/.requirements-installed"
 
 cd "$ROOT_DIR" || exit 1
@@ -50,54 +49,6 @@ ensure_requirements() {
     fi
 }
 
-ensure_ollama_server() {
-    if ! command -v ollama >/dev/null 2>&1; then
-        die "Ollama was not found. Install it from https://ollama.com, then run this launcher again."
-    fi
-
-    if ollama list >/dev/null 2>&1; then
-        return
-    fi
-
-    say "Starting Ollama in the background..."
-    nohup ollama serve > "$OLLAMA_LOG" 2>&1 &
-
-    for _ in $(seq 1 20); do
-        if ollama list >/dev/null 2>&1; then
-            return
-        fi
-        sleep 1
-    done
-
-    die "Ollama did not start. Check $OLLAMA_LOG for details."
-}
-
-model_is_installed() {
-    local model="$1"
-    ollama list | awk 'NR > 1 {print $1}' | grep -Eq "^${model}(:|$)"
-}
-
-ensure_model() {
-    local model="$1"
-
-    if model_is_installed "$model"; then
-        return
-    fi
-
-    say "Missing Ollama model: $model"
-    printf "Download it now? [Y/n] "
-    read -r answer || answer="n"
-
-    case "$answer" in
-        ""|y|Y|yes|YES)
-            ollama pull "$model" || die "Could not download $model."
-            ;;
-        *)
-            die "The app needs $model before ingestion/query will work."
-            ;;
-    esac
-}
-
 pick_port() {
     PORT="$("$VENV_DIR/bin/python" - "$PORT" <<'PY'
 import socket
@@ -132,14 +83,7 @@ say "Preparing launch from $ROOT_DIR"
 pick_python
 ensure_venv
 ensure_requirements
-
-if [ "${SKIP_OLLAMA_CHECK:-0}" != "1" ]; then
-    ensure_ollama_server
-    ensure_model "nomic-embed-text"
-    ensure_model "llama3.2:1b"
-else
-    say "Skipping Ollama checks because SKIP_OLLAMA_CHECK=1."
-fi
+say "No local model checks are run. dLLM correction uses CLS_DLLM_API_URL when configured."
 
 pick_port
 
@@ -150,6 +94,9 @@ fi
 
 URL="http://localhost:$PORT"
 say "Launching Streamlit at $URL"
+if [ "${CLS_USE_API:-0}" = "1" ]; then
+    say "API bridge enabled via CLS_API_URL=${CLS_API_URL:-http://127.0.0.1:8010}"
+fi
 open_browser "$URL"
 
 exec "$VENV_DIR/bin/streamlit" run "$ROOT_DIR/app.py" \
