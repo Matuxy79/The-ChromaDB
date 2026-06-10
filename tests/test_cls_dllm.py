@@ -1,6 +1,14 @@
 import unittest
 
-from examples.cls_dllm import correction_user, needs_correction, parse_bullets, validate_correction
+from examples.cls_dllm import (
+    answer_context,
+    answer_numbers_grounded,
+    answer_user,
+    correction_user,
+    needs_correction,
+    parse_bullets,
+    validate_correction,
+)
 from examples.cls_spectrum import decorate
 
 
@@ -93,6 +101,39 @@ class QueryHighlightTests(unittest.TestCase):
     def test_stopwords_not_highlighted(self):
         out = decorate("what is the gap", "general", query="what is the")
         self.assertNotIn("tok-hit", out)
+
+
+class GenerativeAnswerTests(unittest.TestCase):
+    ROWS = [
+        {
+            "document": "Source: Great_Expectations.txt\nSection: Great Expectations\nPage: 1\n\n"
+                        "Great Expectations, 1867 Edition, by Charles Dickens. Chapter I.",
+            "metadata": {"source": "Great_Expectations.txt", "page": 1},
+        }
+    ]
+
+    def test_context_is_numbered_and_labelled(self):
+        out = answer_context(self.ROWS)
+        self.assertIn("[1]", out)
+        self.assertIn("Source: Great_Expectations.txt, page 1", out)
+
+    def test_context_strips_chunk_header(self):
+        # The "Source:/Section:/Page:" embedding header must not leak into the prompt body.
+        out = answer_context(self.ROWS)
+        self.assertNotIn("Section: Great Expectations\n", out)
+        self.assertIn("Charles Dickens", out)
+
+    def test_user_prompt_carries_question_and_context(self):
+        out = answer_user("great expectations author", self.ROWS)
+        self.assertIn("Question: great expectations author", out)
+        self.assertIn("Charles Dickens", out)
+
+    def test_grounding_guard_accepts_context_numbers(self):
+        # 1867 appears in the context, so it is grounded.
+        self.assertTrue(answer_numbers_grounded("Published in 1867 by Charles Dickens [1].", self.ROWS))
+
+    def test_grounding_guard_flags_invented_numbers(self):
+        self.assertFalse(answer_numbers_grounded("Reach the author at 306-555-0199 [1].", self.ROWS))
 
 
 if __name__ == "__main__":

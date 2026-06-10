@@ -24,6 +24,7 @@ from cls_config import (
     DEFAULT_DLLM_MODEL,
 )
 from examples.cls_cag_cache import SemanticEvidenceCache
+from examples.cls_dllm import ANSWER_SYSTEM, answer_user
 from examples.cls_pipeline import EMBED_DIM, HashEmbedder, collection_count, instant_answer, retrieve
 
 
@@ -431,6 +432,29 @@ def call_dllm_api(
     if isinstance(content, str):
         return content
     raise RuntimeError("dLLM API returned no text content.")
+
+
+def generate_answer(
+    query: str,
+    rows: list[dict],
+    *,
+    model: str = DEFAULT_DLLM_MODEL,
+    timeout: float = 60.0,
+) -> str:
+    """Synthesize a short natural-language answer grounded in the retrieved context.
+
+    Opt-in generative RAG path: unlike `call_dllm_api` correction, this reads the question +
+    retrieved passages and writes a direct answer — but only from the provided context. Uses
+    the same OpenAI-compatible endpoint, so it works against Ollama, OpenRouter, Groq, etc.
+    """
+    if not rows:
+        return ""
+    return call_dllm_api(
+        [{"role": "user", "content": answer_user(query, rows)}],
+        system=ANSWER_SYSTEM,
+        model=model,
+        timeout=timeout,
+    ).strip()
 
 
 def service_status() -> dict:

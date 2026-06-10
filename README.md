@@ -23,15 +23,26 @@ Within the backend, the **Retrieval Encoder** (`HashEmbedder`) encodes the query
 
 The prototype does **not** require a heavyweight model download. The instant RAG/CAG path uses the deterministic `HashEmbedder` and works without `gpt-oss-120b`.
 
-Optional dLLM correction is API-only:
+The optional LLM paths (artifact **correction** and generative **Answer with LLM**) are API-only and OpenAI-compatible — point them at OpenRouter, Ollama, Groq, etc. The easiest way is a gitignored `cls.env` that `launch_cls.sh` auto-sources:
 
 ```bash
-export CLS_DLLM_API_URL="https://your-dllm-endpoint.example/v1"
-export CLS_DLLM_API_KEY="..."
-export CLS_DLLM_MODEL="gpt-oss-120b"
+cp cls.env.example cls.env   # then paste your API key
+./launch_cls.sh
 ```
 
-`CLS_DLLM_API_URL` should point to the external dLLM provider/runtime, not this app's own `http://127.0.0.1:8010/v1` API bridge.
+Or export the vars directly:
+
+```bash
+export CLS_DLLM_API_URL="https://openrouter.ai/api/v1"   # or http://localhost:11434/v1 for Ollama
+export CLS_DLLM_API_KEY="sk-or-..."                      # omit for Ollama
+export CLS_DLLM_MODEL="openai/gpt-oss-120b"              # or e.g. llama3.2 on Ollama
+```
+
+`CLS_DLLM_API_URL` should point to the external provider/runtime, not this app's own `http://127.0.0.1:8010/v1` API bridge.
+
+### Answer with LLM (generative RAG, opt-in)
+
+By default the answer stays **instant extractive text** — no LLM. As **Admin** or **Scientist**, the sidebar's *✎ dLLM API* section adds a **💬 Answer with LLM** toggle. When on (and a backend is configured/online), each search synthesizes a short natural-language answer **strictly from the retrieved passages** (e.g. "great expectations author" → "Charles Dickens"), cites the passage numbers, and is flagged if it emits any number not found in the context. The grounded extractive answer is still shown directly below it for verification.
 
 ## Quick Launch
 

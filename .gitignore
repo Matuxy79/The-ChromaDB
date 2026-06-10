@@ -1,0 +1,17 @@
+# Local dev secrets — holds the dLLM/LLM API key. Never commit.
+cls.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# ChromaDB vector store — regenerable build artifact (rebuild by re-indexing).
+# Too large for git (chroma.sqlite3 exceeds the 100 MB GHE limit).
+chroma_store/
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Logs
+*.log

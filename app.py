@@ -25,6 +25,7 @@ from cls_service import (
     evaluate_retrieval,
     evidence_breakdown,
     file_signature,
+    generate_answer,
     get_cache,
     get_collection,
     ingest_path,
@@ -33,6 +34,7 @@ from cls_service import (
 )
 from examples.cls_dllm import (
     CORRECTION_SYSTEM,
+    answer_numbers_grounded,
     correction_user,
     needs_correction,
     parse_bullets,
@@ -473,6 +475,16 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+def _human_size(num_bytes: int) -> str:
+    """Compact human-readable byte count for batch upload readouts."""
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
 def _render_corpus_admin() -> None:
     """Admin-only path: index the canonical IVU manual."""
     st.header("One-click corpus")
@@ -492,15 +504,23 @@ def _render_corpus_admin() -> None:
 
 
 def _render_upload_section() -> None:
-    """Admin + Scientist path: add and index their own documents."""
-    st.header("Upload more docs")
+    """Admin + Scientist path: drag-and-drop a whole batch of docs and index them at once."""
+    st.subheader("📥 Upload & index documents")
+    st.caption(
+        "Drag and drop a batch of files into the drop zone below — PDF, TXT, or MD. "
+        "They join the Evidence Store; the answer stays instant parsed text."
+    )
     uploaded_files = st.file_uploader(
-        "Add PDF, TXT, or MD files",
+        "Drag and drop files here, or click to browse — multiple files supported",
         type=["pdf", "txt", "md"],
         accept_multiple_files=True,
     )
     if uploaded_files:
-        st.caption(f"📎 {len(uploaded_files)} file(s) ready to index.")
+        sizes = [(f.name, len(f.getvalue())) for f in uploaded_files]
+        total_bytes = sum(size for _, size in sizes)
+        st.caption(f"📎 {len(uploaded_files)} file(s) ready · {_human_size(total_bytes)} total.")
+        with st.expander(f"Files queued for indexing ({len(sizes)})", expanded=False):
+            st.markdown("\n".join(f"- {name} — {_human_size(size)}" for name, size in sizes))
     reindex_uploads = (
         st.checkbox(
             "Re-index files already in the store",
@@ -568,6 +588,7 @@ def _render_upload_section() -> None:
 cag_enabled = True
 min_similarity = 0.97
 dllm_enabled = False
+synth_enabled = False
 
 with st.sidebar:
     st.header("Active path")
@@ -593,8 +614,6 @@ with st.sidebar:
 
     if role_can("index"):
         _render_corpus_admin()
-    if role_can("upload"):
-        _render_upload_section()
 
     # Read-only corpus visibility for every operating tier; the bare User path
     # stays a pure ask-and-read surface, so it sees no store internals.
@@ -635,6 +654,14 @@ with st.sidebar:
             disabled=not dllm_api_online,
             help="Needs the configured dLLM API model online. When on, applies a guarded correction in place.",
         )
+        # Opt-in generative RAG: synthesise a direct NL answer from the retrieved context.
+        synth_enabled = st.toggle(
+            "💬 Answer with LLM (synthesize from context)",
+            value=False,
+            disabled=not dllm_api_online,
+            help="Reads the question + retrieved passages and writes a direct answer, grounded "
+                 "in the indexed documents only. The instant extractive answer stays shown below it.",
+        )
         if not dllm_api_online:
             st.caption(dllm_endpoint.get("detail", "dLLM API offline — answers are instant parsed text only."))
 
@@ -643,6 +670,12 @@ with st.sidebar:
             '<div class="cls-rolelock">📚 Corpus is curated by an administrator.</div>',
             unsafe_allow_html=True,
         )
+
+# Full-width drag-and-drop batch upload — roomy drop target for many files at once,
+# shown above the ask/answer columns for upload-capable tiers (Admin / Scientist).
+if role_can("upload"):
+    _render_upload_section()
+    st.divider()
 
 left, right = st.columns([1.05, 1], gap="large")
 
@@ -708,6 +741,12 @@ with left:
                     "reason": reason,
                     "text": None,
                 }
+                # Opt-in generative answer: arm it for this query when the toggle is on, so the
+                # right column synthesises once and caches the text across reruns.
+                st.session_state["last_synth"] = {
+                    "status": "pending" if synth_enabled else "off",
+                    "text": None,
+                }
 
     if role_can("eval") and st.button("Run graded offline checks", use_container_width=True):
         if collection_count(get_collection()) == 0:
@@ -754,6 +793,40 @@ with right:
         def card(sentences: list[str]) -> str:
             body = "<br>".join(f"• {decorate(s, category, stored_query)}" for s in sentences)
             return f"{card_open}{body}</div>"
+
+        # Generative RAG answer (opt-in): synthesised from the retrieved context and shown as the
+        # headline answer above the trusted extractive bullets. Runs once per query, then caches
+        # the text in session state so reruns (chip clicks, toggles) don't re-call the API.
+        synth = st.session_state.get("last_synth", {"status": "off"})
+        if synth.get("status") == "pending" and dllm_api_online and synth_enabled:
+            with st.spinner("💬 Synthesizing answer from retrieved context…"):
+                try:
+                    synth_text = generate_answer(stored_query, rows, model=DLLM_MODEL)
+                    synth = (
+                        {"status": "done", "text": synth_text, "grounded": answer_numbers_grounded(synth_text, rows)}
+                        if synth_text
+                        else {"status": "empty", "text": None}
+                    )
+                except Exception as exc:
+                    synth = {"status": "error", "text": str(exc)}
+            st.session_state["last_synth"] = synth
+
+        if synth.get("status") == "done" and synth.get("text"):
+            st.markdown(
+                f'<span class="cls-badge" style="--hue:{hue}">💬 LLM answer · grounded in '
+                f'{len(rows)} retrieved source(s)</span>',
+                unsafe_allow_html=True,
+            )
+            with st.container(border=True):
+                st.markdown(synth["text"])
+            if not synth.get("grounded", True):
+                st.caption("⚠ Contains numbers not found verbatim in the retrieved context — "
+                           "verify against the source passages below.")
+            st.caption("💬 LLM-synthesized from retrieved context · the grounded extraction follows below.")
+        elif synth.get("status") == "error":
+            st.caption(f"💬 LLM synthesis failed — showing the grounded extraction. ({synth.get('text')})")
+        elif synth.get("status") == "empty":
+            st.caption("💬 LLM returned no answer — showing the grounded extraction.")
 
         if answer:
             dllm = st.session_state.get("last_dllm", {"status": "dormant"})

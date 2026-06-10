@@ -118,3 +118,52 @@ def validate_correction(text: str, sentences: list[str]) -> bool:
     """The trust contract: a correction is only shown if it invented no numbers and kept
     every citation verbatim. Otherwise the instant grounded extraction stands."""
     return numbers_grounded(text, sentences) and citations_preserved(text, sentences)
+
+
+# --- Generative RAG answer (opt-in) ----------------------------------------------------- #
+# A second, *opt-in* LLM mode distinct from correction: instead of only repairing artifacts,
+# it synthesises a short natural-language answer to the user's question — but strictly from
+# the retrieved context passages, never outside knowledge. Off by default; the instant
+# extractive answer stays the trusted ground truth shown alongside it.
+
+_CHUNK_HEADER = re.compile(r"^Source:.*?\nSection:.*?\nPage:.*?\n\n", re.S)
+
+
+def answer_context(rows: list[dict], max_passages: int = 6, max_chars: int = 900) -> str:
+    """Render retrieved rows as numbered, source-labelled context blocks for the prompt."""
+    blocks: list[str] = []
+    for position, row in enumerate(rows[:max_passages], start=1):
+        meta = row.get("metadata", {}) or {}
+        source = meta.get("source", "source")
+        page = meta.get("page", "?")
+        body = _CHUNK_HEADER.sub("", row.get("document", "")).strip()
+        body = re.sub(r"\s+", " ", body)[:max_chars]
+        blocks.append(f"[{position}] (Source: {source}, page {page})\n{body}")
+    return "\n\n".join(blocks)
+
+
+ANSWER_SYSTEM = (
+    "You are a retrieval-grounded assistant for the Canadian Light Source. Answer the "
+    "user's question using ONLY the numbered context passages provided.\n"
+    "Hard rules:\n"
+    "1. Use only facts found in the context. Never use outside knowledge or guess.\n"
+    '2. If the answer is not in the context, reply exactly: "Not found in the indexed documents."\n'
+    "3. Lead with a direct one- or two-sentence answer to the question.\n"
+    "4. Cite the passages you used by their bracket numbers, e.g. [1], [2].\n"
+    "5. Preserve numbers, names, and identifiers exactly as written in the context."
+)
+
+
+def answer_user(query: str, rows: list[dict]) -> str:
+    return (
+        f"Context passages:\n{answer_context(rows)}\n\n"
+        f"Question: {query}\n\n"
+        "Answer using only the context above, then cite the passage numbers you used."
+    )
+
+
+def answer_numbers_grounded(text: str, rows: list[dict]) -> bool:
+    """Light guard for the generative answer: every multi-digit run it emits must already
+    appear in the retrieved context (otherwise the UI flags it as unverified)."""
+    context = " ".join(row.get("document", "") for row in rows)
+    return numbers_grounded(text, [context])

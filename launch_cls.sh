@@ -79,7 +79,20 @@ open_browser() {
     fi
 }
 
+load_env() {
+    # Auto-source local dev config (LLM API URL/key/model) so the generative
+    # "Answer with LLM" toggle works without exporting vars by hand. Gitignored.
+    if [ -f "$ROOT_DIR/cls.env" ]; then
+        say "Loading config from cls.env"
+        set -a
+        # shellcheck disable=SC1091
+        . "$ROOT_DIR/cls.env"
+        set +a
+    fi
+}
+
 say "Preparing launch from $ROOT_DIR"
+load_env
 pick_python
 ensure_venv
 ensure_requirements

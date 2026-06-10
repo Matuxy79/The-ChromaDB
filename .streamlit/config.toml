@@ -1,0 +1,8 @@
+[server]
+# Bulk document drops: lift Streamlit's default 200 MB ceiling so a large batch
+# of PDFs/TXT/MD can be dragged in at once. Tune down if memory-constrained.
+maxUploadSize = 2000
+maxMessageSize = 2000
+
+[browser]
+gatherUsageStats = false
