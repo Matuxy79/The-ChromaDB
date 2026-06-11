@@ -32,7 +32,7 @@ from cls_service import (
     reset_collection,
     uploaded_signature,
 )
-from examples.cls_dllm import (
+from cls_backend.dllm import (
     CORRECTION_SYSTEM,
     answer_numbers_grounded,
     correction_user,
@@ -40,7 +40,7 @@ from examples.cls_dllm import (
     parse_bullets,
     validate_correction,
 )
-from examples.cls_spectrum import (
+from cls_backend.spectrum import (
     SUGGESTED_PROBLEMS,
     category_meta,
     classify_query,
@@ -82,9 +82,11 @@ ROLES: dict[str, dict] = {
     },
 }
 ROLE_NAMES = list(ROLES)
-# Architecture: ONE active model — the embedding Retrieval Encoder. The answer is instant
-# clean parsed text from the RAG/CAG dual layer (DocuSearch-style); the LLM does no text
-# augmentation by default. A single optional LLM stays wired in but OFF unless toggled on.
+# Architecture: ONE active *local* model — the embedding Retrieval Encoder. Retrieval is instant
+# and primary (DocuSearch-style). The generative answer is carried by an external OpenAI-compatible
+# LLM — default carrier OpenRouter · openai/gpt-oss-120b — wired in as a single on/off toggle that
+# is ON by default once a carrier key is configured. It synthesizes strictly from the retrieved
+# context, and the grounded extractive answer is always shown beneath it for audit.
 DLLM_MODEL = DEFAULT_DLLM_MODEL
 
 
@@ -98,7 +100,7 @@ def render_evidence_store(rows: list[dict]) -> None:
     """Idle-state panel: visualize what is indexed, one bar per document."""
     st.markdown("### 📚 Evidence Store")
     if not rows:
-        st.info("Index the IVU manual, then run a search to see scored source passages.")
+        st.info("Index the IVU manual, then run a search to see scored retrieval evidence.")
         return
     total_chunks = sum(r["chunks"] for r in rows)
     st.caption(f"{len(rows)} document(s) · {total_chunks} indexed chunks — run a search to query them.")
@@ -187,7 +189,7 @@ def dllm_api_status() -> dict:
         "model": DLLM_MODEL,
         "configured": False,
         "online": False,
-        "detail": f"Start the dLLM API bridge at {API_URL}, or leave correction off.",
+        "detail": f"Start the API bridge at {API_URL}, or use embedded retrieval-only mode.",
     }
 
 
@@ -210,6 +212,49 @@ def correct_with_dllm_api(sentences: list[str]) -> list[str]:
         timeout=60.0,
     )
     return parse_bullets(response.get("content", ""))
+
+
+def display_model_name(model: str) -> str:
+    return (model or "model").rsplit("/", 1)[-1]
+
+
+def retrieval_evidence_summary(rows: list[dict]) -> tuple[str, bool]:
+    """Compact HTML summary of the retrieval rows and their source documents."""
+    sources: dict[str, dict] = {}
+    for row in rows:
+        meta = row.get("metadata", {}) or {}
+        source = str(meta.get("source") or "source")
+        entry = sources.setdefault(source, {"count": 0, "pages": []})
+        entry["count"] += 1
+        page = meta.get("page")
+        if page not in (None, "", "?") and page not in entry["pages"]:
+            entry["pages"].append(page)
+
+    doc_count = len(sources)
+    row_word = "row" if len(rows) == 1 else "rows"
+    doc_word = "document" if doc_count == 1 else "documents"
+    pieces: list[str] = []
+    for source, entry in list(sources.items())[:4]:
+        pages = entry["pages"]
+        pages_text = ""
+        if pages:
+            shown = ", ".join(str(page) for page in pages[:4])
+            if len(pages) > 4:
+                shown += ", ..."
+            pages_text = f" · pages {shown}"
+        count_word = "row" if entry["count"] == 1 else "rows"
+        pieces.append(
+            f"<strong>{html.escape(source)}</strong> "
+            f"({entry['count']} {count_word}{html.escape(pages_text)})"
+        )
+    if len(sources) > 4:
+        pieces.append(f"{len(sources) - 4} more")
+
+    summary = (
+        f"{len(rows)} ranked evidence {row_word} from {doc_count} {doc_word}: "
+        + "; ".join(pieces)
+    )
+    return summary, doc_count > 1
 
 
 st.markdown(
@@ -311,6 +356,27 @@ st.markdown(
         border-left: 5px solid var(--hue,#ff8a3d);
         box-shadow: var(--glow, 0 6px 22px rgba(120,80,60,0.10));
         color: var(--ink); line-height: 1.6;
+      }
+      .cls-statusline {
+        display: flex; flex-wrap: wrap; align-items: center; gap: 0.45rem;
+        margin: 0.1rem 0 0.65rem;
+      }
+      .cls-mode-note {
+        color: var(--muted); font-size: 0.86rem; line-height: 1.45;
+        margin: 0.25rem 0 0.65rem;
+      }
+      .cls-evidence-strip {
+        border-radius: 10px; padding: 0.72rem 0.82rem; margin: 0.25rem 0 0.7rem;
+        background: #f7fbff;
+        border: 1px solid #d9e8f6;
+        border-left: 5px solid var(--blue);
+        line-height: 1.45;
+      }
+      .cls-evidence-title {
+        font-weight: 800; color: var(--ink); margin-bottom: 0.15rem;
+      }
+      .cls-evidence-copy {
+        color: var(--muted); font-size: 0.86rem;
       }
       .cls-answer code { color: #b8541a; background: #fbeee4; padding: 0 0.3em; border-radius: 5px; }
       .cls-q { color: var(--muted); font-style: italic; font-size: 0.92rem; }
@@ -508,7 +574,7 @@ def _render_upload_section() -> None:
     st.subheader("📥 Upload & index documents")
     st.caption(
         "Drag and drop a batch of files into the drop zone below — PDF, TXT, or MD. "
-        "They join the Evidence Store; the answer stays instant parsed text."
+        "They join the Evidence Store; retrieval evidence stays separate from any carrier synthesis."
     )
     uploaded_files = st.file_uploader(
         "Drag and drop files here, or click to browse — multiple files supported",
@@ -589,6 +655,7 @@ cag_enabled = True
 min_similarity = 0.97
 dllm_enabled = False
 synth_enabled = False
+answer_mode = "Grounded"
 
 with st.sidebar:
     st.header("Active path")
@@ -609,8 +676,10 @@ with st.sidebar:
     st.caption(f"Streamlit → {'FastAPI' if USE_API_BACKEND else 'embedded service'}")
     st.code(f"{API_URL}/v1/query\n{API_URL}/v1/chat/completions\n{API_URL}/v1/dllm/status", language="text")
     dllm_state = "online" if dllm_api_online else "offline"
-    dllm_config = "configured" if dllm_endpoint.get("configured") else "not configured"
-    st.caption(f"dLLM API {dllm_state} · {dllm_endpoint.get('model', DLLM_MODEL)} · {dllm_config}")
+    carrier_name = dllm_endpoint.get("carrier", "OpenRouter")
+    st.caption(
+        f"Inference carrier · {carrier_name} · {dllm_endpoint.get('model', DLLM_MODEL)} · {dllm_state}"
+    )
 
     if role_can("index"):
         _render_corpus_admin()
@@ -645,25 +714,48 @@ with st.sidebar:
     get_cache().distance_max = 1.0 - min_similarity
 
     if role_can("dllm"):
-        st.header("✎ dLLM API")
-        st.caption("Off by default — the answer is instant clean parsed text with no LLM. Turn on to let "
-                   f"the {DLLM_MODEL} API connection correct extraction artifacts (it never invents facts).")
-        dllm_enabled = st.toggle(
-            "Enable dLLM API correction",
-            value=False,
-            disabled=not dllm_api_online,
-            help="Needs the configured dLLM API model online. When on, applies a guarded correction in place.",
+        carrier_name = dllm_endpoint.get("carrier", "OpenRouter")
+        model_name = display_model_name(DLLM_MODEL)
+        st.header("💬 Inference carrier")
+        st.caption(
+            f"{carrier_name} · {DLLM_MODEL}. The carrier writes the optional synthesis only; "
+            "document names, pages, and evidence rows always come from Chroma retrieval."
         )
-        # Opt-in generative RAG: synthesise a direct NL answer from the retrieved context.
+        # Single on/off for carrier synthesis — the generative RAG path, ON by default once the
+        # carrier is ready (key present + reachable).
         synth_enabled = st.toggle(
-            "💬 Answer with LLM (synthesize from context)",
+            f"Synthesize answer with {model_name}",
+            value=dllm_api_online,
+            disabled=not dllm_api_online,
+            help="Reads the question + retrieval evidence and writes a direct answer. Off falls "
+                 "back to deterministic extraction.",
+        )
+        # Carrier scope: Grounded (default) keeps the strict trust contract — answer only from the
+        # indexed documents, else refuse. Hybrid lets the carrier also answer general / natural-
+        # language questions from its own knowledge when the documents don't cover them.
+        answer_mode = st.radio(
+            "Answer mode",
+            ["Grounded", "Hybrid"],
+            horizontal=True,
+            disabled=not (dllm_api_online and synth_enabled),
+            help="Grounded · answers strictly from the indexed documents (refuses otherwise). "
+                 "Hybrid · also answers general questions from the model's own knowledge.",
+        )
+        st.caption(
+            "**Grounded** answers only from your indexed documents. **Hybrid** also answers "
+            "natural-language / general questions from the model when the documents don't cover them."
+        )
+        # Secondary, optional: let the same carrier also repair PDF extraction artifacts in the
+        # grounded bullets. Off by default; orthogonal to the generative answer above.
+        dllm_enabled = st.checkbox(
+            "Also clean extraction with carrier",
             value=False,
             disabled=not dllm_api_online,
-            help="Reads the question + retrieved passages and writes a direct answer, grounded "
-                 "in the indexed documents only. The instant extractive answer stays shown below it.",
+            help="Applies a guarded in-place correction to the extractive bullets (never invents "
+                 "facts). Independent of the generative answer toggle.",
         )
         if not dllm_api_online:
-            st.caption(dllm_endpoint.get("detail", "dLLM API offline — answers are instant parsed text only."))
+            st.caption(dllm_endpoint.get("detail", "Carrier offline — retrieval evidence and extraction still work."))
 
     if not role_can("index") and not role_can("upload"):
         st.markdown(
@@ -733,19 +825,21 @@ with left:
                 st.session_state["last_answer"] = result["answer"]
                 st.session_state["last_from_cache"] = result["from_cache"]
                 st.session_state["last_similarity"] = result["similarity"]
-                # dLLM is off by default and never touches text unless toggled on. If on,
-                # arm it only when the instant text shows artifacts worth correcting.
+                # Carrier cleanup is separate from synthesis. If enabled, arm it only when
+                # the instant text shows artifacts worth correcting.
                 activate, reason = needs_correction(result["answer"])
                 st.session_state["last_dllm"] = {
                     "status": "pending" if (activate and result["answer"]) else "dormant",
                     "reason": reason,
                     "text": None,
                 }
-                # Opt-in generative answer: arm it for this query when the toggle is on, so the
-                # right column synthesises once and caches the text across reruns.
+                # Generative answer (on by default when the carrier is ready): arm it for this
+                # query when the toggle is on, so the right column synthesises once and caches
+                # the text across reruns.
                 st.session_state["last_synth"] = {
                     "status": "pending" if synth_enabled else "off",
                     "text": None,
+                    "strict": answer_mode == "Grounded",
                 }
 
     if role_can("eval") and st.button("Run graded offline checks", use_container_width=True):
@@ -781,10 +875,27 @@ with right:
         else:
             cag_badge = '<span class="cls-q">↯ fresh retrieval</span>'
 
+        carrier_name = dllm_endpoint.get("carrier", "OpenRouter")
+        model_name = display_model_name(DLLM_MODEL)
+        # Mode this query was run under (armed at submit time), so the badge stays truthful across reruns.
+        run_grounded = st.session_state.get("last_synth", {}).get("strict", True)
+        mode_label = "grounded" if run_grounded else "hybrid"
+        if dllm_api_online and synth_enabled:
+            inference_badge = (
+                '<span class="cls-badge" style="--hue:#6aa9ff">'
+                f'💬 Synthesis on · {mode_label} · {html.escape(model_name)}</span>'
+            )
+        else:
+            inference_badge = '<span class="cls-q">💬 synthesis off — extraction only</span>'
+
         st.markdown("### ✨ Answer")
         st.markdown(
-            f'Question type · <span class="cls-badge" style="--hue:{hue}">'
-            f'{meta["glyph"]} {meta["label"]}</span> &nbsp; {cag_badge}',
+            '<div class="cls-statusline">'
+            f'<span>Question type · </span><span class="cls-badge" style="--hue:{hue}">'
+            f'{meta["glyph"]} {meta["label"]}</span>'
+            f'{cag_badge}'
+            f'{inference_badge}'
+            '</div>',
             unsafe_allow_html=True,
         )
 
@@ -794,50 +905,80 @@ with right:
             body = "<br>".join(f"• {decorate(s, category, stored_query)}" for s in sentences)
             return f"{card_open}{body}</div>"
 
-        # Generative RAG answer (opt-in): synthesised from the retrieved context and shown as the
-        # headline answer above the trusted extractive bullets. Runs once per query, then caches
+        # Generative RAG answer (on by default when the carrier is ready): synthesised from the
+        # retrieved context and shown as the headline answer above the trusted extractive bullets.
+        # Runs once per query, then caches
         # the text in session state so reruns (chip clicks, toggles) don't re-call the API.
         synth = st.session_state.get("last_synth", {"status": "off"})
-        if synth.get("status") == "pending" and dllm_api_online and synth_enabled:
-            with st.spinner("💬 Synthesizing answer from retrieved context…"):
-                try:
-                    synth_text = generate_answer(stored_query, rows, model=DLLM_MODEL)
-                    synth = (
-                        {"status": "done", "text": synth_text, "grounded": answer_numbers_grounded(synth_text, rows)}
-                        if synth_text
-                        else {"status": "empty", "text": None}
-                    )
-                except Exception as exc:
-                    synth = {"status": "error", "text": str(exc)}
+        synth_display_enabled = bool(dllm_api_online and synth_enabled)
+        if synth_display_enabled and synth.get("status") == "off":
+            synth = {"status": "pending", "text": None, "strict": synth.get("strict", answer_mode == "Grounded")}
             st.session_state["last_synth"] = synth
 
-        if synth.get("status") == "done" and synth.get("text"):
+        # Mode this query was armed under: drives grounding strictness and how much provenance we surface.
+        run_strict = synth.get("strict", True)
+
+        if synth.get("status") == "pending" and synth_display_enabled:
+            with st.spinner("💬 Synthesizing answer…"):
+                try:
+                    synth_text = generate_answer(stored_query, rows, model=DLLM_MODEL, grounded=run_strict)
+                    synth = (
+                        {"status": "done", "text": synth_text, "strict": run_strict,
+                         "grounded": answer_numbers_grounded(synth_text, rows)}
+                        if synth_text
+                        else {"status": "empty", "text": None, "strict": run_strict}
+                    )
+                except Exception as exc:
+                    synth = {"status": "error", "text": str(exc), "strict": run_strict}
+            st.session_state["last_synth"] = synth
+
+        if synth_display_enabled and synth.get("status") == "done" and synth.get("text"):
+            cite_hint = (
+                '<span class="cls-q">citations [n] map to retrieval evidence rows below</span>'
+                if run_strict else ""
+            )
             st.markdown(
-                f'<span class="cls-badge" style="--hue:{hue}">💬 LLM answer · grounded in '
-                f'{len(rows)} retrieved source(s)</span>',
+                '<div class="cls-statusline">'
+                f'<span class="cls-badge" style="--hue:#6aa9ff">💬 Carrier synthesis · '
+                f'{html.escape(carrier_name)} · {html.escape(model_name)}</span>'
+                f'{cite_hint}'
+                '</div>',
                 unsafe_allow_html=True,
             )
             with st.container(border=True):
                 st.markdown(synth["text"])
-            if not synth.get("grounded", True):
-                st.caption("⚠ Contains numbers not found verbatim in the retrieved context — "
-                           "verify against the source passages below.")
-            st.caption("💬 LLM-synthesized from retrieved context · the grounded extraction follows below.")
-        elif synth.get("status") == "error":
-            st.caption(f"💬 LLM synthesis failed — showing the grounded extraction. ({synth.get('text')})")
-        elif synth.get("status") == "empty":
-            st.caption("💬 LLM returned no answer — showing the grounded extraction.")
+            if run_strict:
+                if not synth.get("grounded", True):
+                    st.caption("⚠ Contains numbers not found verbatim in the retrieved context — "
+                               "verify against the retrieval evidence below.")
+                st.caption(
+                    f"💬 Generated by the {carrier_name} inference carrier from the retrieval evidence; "
+                    "the deterministic extraction follows for audit."
+                )
+            else:
+                st.caption(
+                    f"💬 Hybrid answer from the {carrier_name} carrier — uses your indexed documents "
+                    "when they're relevant, otherwise the model's own knowledge."
+                )
+        elif synth_display_enabled and synth.get("status") == "error":
+            st.caption(f"💬 Carrier synthesis failed — showing deterministic extraction. ({synth.get('text')})")
+        elif synth_display_enabled and synth.get("status") == "empty":
+            st.caption("💬 Carrier returned no synthesis — showing deterministic extraction.")
 
         if answer:
             dllm = st.session_state.get("last_dllm", {"status": "dormant"})
+            st.markdown(
+                '<span class="cls-badge" style="--hue:#6fd58a">⚡ Deterministic extraction · RAG/CAG</span>',
+                unsafe_allow_html=True,
+            )
             placeholder = st.empty()
 
             if dllm.get("status") == "corrected" and dllm.get("text"):
                 # Settled from a prior run — render directly, no flash, no model call.
                 placeholder.markdown(card(dllm["text"]), unsafe_allow_html=True)
-                st.caption(f"✎ dLLM corrected — {dllm.get('reason')}.")
+                st.caption(f"✎ Extraction cleaned by {carrier_name} — {dllm.get('reason')}.")
             elif dllm.get("status") == "pending" and dllm_api_online and dllm_enabled:
-                # Instant text appears first; the dLLM API then corrects it in place.
+                # Instant text appears first; the carrier then corrects it in place.
                 # Re-checked for grounding at the end; reverts on drift.
                 placeholder.markdown(card(answer), unsafe_allow_html=True)
                 try:
@@ -847,27 +988,51 @@ with right:
                         st.session_state["last_dllm"] = {
                             "status": "corrected", "reason": dllm.get("reason"), "text": corrected
                         }
-                        st.caption(f"✎ dLLM corrected — {dllm.get('reason')}.")
+                        st.caption(f"✎ Extraction cleaned by {carrier_name} — {dllm.get('reason')}.")
                     else:
                         placeholder.markdown(card(answer), unsafe_allow_html=True)
                         st.session_state["last_dllm"] = {"status": "reverted", "reason": dllm.get("reason"), "text": None}
-                        st.caption("⚡ instant — dLLM drifted, kept the grounded extraction.")
+                        st.caption("⚡ Carrier cleanup drifted, so the deterministic extraction was kept.")
                 except Exception:
                     placeholder.markdown(card(answer), unsafe_allow_html=True)
                     st.session_state["last_dllm"] = {"status": "reverted", "reason": dllm.get("reason"), "text": None}
-                    st.caption("⚡ instant — dLLM unavailable, kept the grounded extraction.")
+                    st.caption("⚡ Carrier cleanup unavailable, so the deterministic extraction was kept.")
             else:
                 placeholder.markdown(card(answer), unsafe_allow_html=True)
-                st.caption("⚡ instant — clean parsed text from RAG/CAG, no LLM.")
+                st.caption(
+                    "⚡ Deterministic extraction from retrieval evidence. No inference carrier modified this text."
+                )
         else:
-            st.warning("No strong sentence-level extraction found. Review the source passages below.")
+            synth_answered = (not run_strict) and synth.get("status") == "done" and bool(synth.get("text"))
+            if synth_answered:
+                st.caption(
+                    "⚡ No verbatim passage matched — the Hybrid answer above came from the carrier's "
+                    "own knowledge. Retrieval evidence below for reference."
+                )
+            else:
+                st.warning("No strong sentence-level extraction found. Review the retrieval evidence below.")
 
-        st.markdown("### Source passages")
+        evidence_summary, mixed_evidence = retrieval_evidence_summary(rows)
+        st.markdown("### Retrieval evidence")
+        st.markdown(
+            '<div class="cls-evidence-strip">'
+            '<div class="cls-evidence-title">Chroma-ranked evidence rows, not model output</div>'
+            f'<div class="cls-evidence-copy">{evidence_summary}</div>'
+            f'<div class="cls-evidence-copy">Carrier citations like [1] refer to these row numbers; '
+            f'extractive citations name the source document and page directly.</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        if mixed_evidence:
+            st.caption(
+                "Mixed evidence set: retrieved rows came from multiple indexed documents. "
+                "For broad or misspelled prompts, tighten the query or lower Top-K for a cleaner evidence set."
+            )
         hit_terms = stored_query
         for index, row in enumerate(rows, start=1):
             meta = row["metadata"]
             label = (
-                f"{index}. {meta.get('source', 'source')}, "
+                f"Evidence {index} · {meta.get('source', 'source')}, "
                 f"page {meta.get('page', '?')} — {meta.get('section', 'section')}"
             )
             with st.expander(label, expanded=index <= 2):
@@ -886,9 +1051,12 @@ if eval_rows:
 
 st.divider()
 st.caption(
-    f"{APP_VERSION} · DocuSearch-style: the answer is **instant clean parsed text** from the RAG/CAG "
-    "dual layer — **Retrieval Encoder** (HashEmbedder, the one active model) → **CAG Layer** / "
-    "**Evidence Store** (ChromaDB) → deterministic clean-parse + highlighting. **No LLM augments the "
-    f"text by default**; the optional **dLLM API** ({DLLM_MODEL}) stays wired in but OFF unless toggled, "
-    "and even then only corrects artifacts (never invents facts). Fully offline-capable; no dsrag import."
+    f"{APP_VERSION} · DocuSearch-style RAG/CAG — **Retrieval Encoder** (HashEmbedder, the one active "
+    "*local* model) → **CAG Layer** / **Evidence Store** (ChromaDB) → deterministic clean-parse + "
+    f"highlighting. The **{DLLM_MODEL}** answer (via the {dllm_endpoint.get('carrier', 'OpenRouter')} "
+    "inference carrier) is **on by default** when a key is configured. In **Grounded** mode (default) "
+    "it synthesizes strictly from retrieval evidence rows; switch **Answer mode** to **Hybrid** to also "
+    "answer general / natural-language questions from the model's own knowledge. Source documents and "
+    "pages always come from Chroma, not the carrier. Toggle synthesis off for deterministic extraction "
+    "only; fully offline-capable with no carrier."
 )

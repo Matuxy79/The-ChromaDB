@@ -3,9 +3,10 @@ import uuid
 
 import chromadb
 
-from examples.cls_cag_cache import SemanticEvidenceCache
-from examples.cls_pipeline import (
+from cls_backend.cag_cache import SemanticEvidenceCache
+from cls_backend.pipeline import (
     HashEmbedder,
+    build_extractive_answer,
     clean_sentence,
     clean_sentences,
     instant_answer,
@@ -87,6 +88,31 @@ class RetrieveAndInstantAnswerTests(unittest.TestCase):
         instant_answer("anything", collection=self.collection, cache=cache,
                        embedder=self.embedder, top_k=4, cache_enabled=False)
         self.assertEqual(cache.count(), 0)
+
+    def test_extractive_answer_keeps_adjacent_segment_page_citation(self):
+        rows = [
+            {
+                "document": (
+                    doc("IVU.pdf", "Contacts", 4, "The Undulator beamline phone is ext. 3832.")
+                    + "\n\n--- adjacent segment ---\n\n"
+                    + doc("IVU.pdf", "Optics", 7, "The undulator energy range spans several kiloelectronvolts.")
+                ),
+                "metadata": {
+                    "source": "IVU.pdf",
+                    "source_hash": "h1",
+                    "page": 4,
+                    "section": "Contacts",
+                    "chunk_index": 0,
+                },
+                "score": 0.9,
+            }
+        ]
+
+        answer = build_extractive_answer("energy range", rows)
+
+        self.assertTrue(answer)
+        self.assertIn("[Source: IVU.pdf, page 7]", answer[0])
+        self.assertNotIn("[Source: IVU.pdf, page 4]", answer[0])
 
 
 if __name__ == "__main__":

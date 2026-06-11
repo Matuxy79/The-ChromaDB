@@ -45,15 +45,28 @@ ensure_requirements() {
     fi
 }
 
+load_env() {
+    # Match launch_cls.sh: auto-source local carrier config so FastAPI bridge mode
+    # sees the same OpenRouter key/model as the Streamlit embedded path.
+    if [ -f "$ROOT_DIR/cls.env" ]; then
+        say "Loading config from cls.env"
+        set -a
+        # shellcheck disable=SC1091
+        . "$ROOT_DIR/cls.env"
+        set +a
+    fi
+}
+
 say "Preparing API from $ROOT_DIR"
+load_env
 pick_python
 ensure_venv
 ensure_requirements
 
 if [ -n "${CLS_DLLM_API_URL:-}" ]; then
-    say "dLLM API endpoint: $CLS_DLLM_API_URL"
+    say "Inference carrier endpoint: $CLS_DLLM_API_URL"
 else
-    say "CLS_DLLM_API_URL is not set; /v1/dllm/chat will report unconfigured."
+    say "Using default inference carrier endpoint unless overridden by CLS_DLLM_API_URL."
 fi
 
 if [ "${LAUNCHER_DRY_RUN:-0}" = "1" ]; then

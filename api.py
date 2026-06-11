@@ -11,13 +11,13 @@ from pydantic import BaseModel, Field
 from cls_config import APP_VERSION, DEFAULT_DLLM_MODEL
 from cls_service import answer_text, ask_manual, call_dllm_api, dllm_status, service_status
 
-CLS_RAG_MODEL = "cls-rag-cag-v0.9"
+CLS_RAG_MODEL = "cls-rag-cag-v1.0"
 
 
 app = FastAPI(
     title="CLS IVU RAG+CAG API",
     version=APP_VERSION,
-    description="Shared RAG API plus dLLM API proxy for Streamlit and OpenAI-compatible frontends.",
+    description="Shared RAG API plus inference carrier proxy for Streamlit and OpenAI-compatible frontends.",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -122,7 +122,7 @@ def chat_completions(request: ChatCompletionRequest) -> dict[str, Any]:
                 model=request.model,
             )
         except Exception as exc:
-            raise HTTPException(status_code=503, detail=f"dLLM API model call failed: {exc}") from exc
+            raise HTTPException(status_code=503, detail=f"Inference carrier model call failed: {exc}") from exc
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
@@ -177,5 +177,5 @@ def dllm_chat(request: DllmChatRequest) -> dict[str, str]:
             model=request.model,
         )
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"dLLM API model call failed: {exc}") from exc
+        raise HTTPException(status_code=503, detail=f"Inference carrier model call failed: {exc}") from exc
     return {"model": request.model, "content": text}

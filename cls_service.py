@@ -9,6 +9,7 @@ from threading import RLock
 from typing import Any
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 
 import chromadb
 import fitz
@@ -23,9 +24,9 @@ from cls_config import (
     DEFAULT_DLLM_API_URL,
     DEFAULT_DLLM_MODEL,
 )
-from examples.cls_cag_cache import SemanticEvidenceCache
-from examples.cls_dllm import ANSWER_SYSTEM, answer_user
-from examples.cls_pipeline import EMBED_DIM, HashEmbedder, collection_count, instant_answer, retrieve
+from cls_backend.cag_cache import SemanticEvidenceCache
+from cls_backend.dllm import ANSWER_SYSTEM, ASSIST_SYSTEM, answer_user, assist_user
+from cls_backend.pipeline import EMBED_DIM, HashEmbedder, collection_count, instant_answer, retrieve
 
 
 @dataclass(frozen=True)
@@ -149,6 +150,7 @@ def split_page_text(
     source_name: str,
     source_hash: str,
     starting_index: int,
+    extra_metadata: dict | None = None,
 ) -> list[Chunk]:
     section = detect_section(text, f"Page {page_number}")
     paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
@@ -163,16 +165,19 @@ def split_page_text(
             return
         context_text = f"Source: {source_name}\nSection: {section}\nPage: {page_number}\n\n{clean}"
         chunk_id = f"{source_hash}:{chunk_index:05d}"
+        meta = {
+            "source": source_name,
+            "source_hash": source_hash,
+            "page": page_number,
+            "section": section,
+            "chunk_index": chunk_index,
+        }
+        if extra_metadata:
+            meta.update(extra_metadata)
         chunks.append(
             Chunk(
                 text=context_text,
-                metadata={
-                    "source": source_name,
-                    "source_hash": source_hash,
-                    "page": page_number,
-                    "section": section,
-                    "chunk_index": chunk_index,
-                },
+                metadata=meta,
                 chunk_id=chunk_id,
             )
         )
@@ -202,7 +207,7 @@ def split_page_text(
     return chunks
 
 
-def build_chunks(path: Path, source_hash: str) -> list[Chunk]:
+def build_chunks(path: Path, source_hash: str, extra_metadata: dict | None = None) -> list[Chunk]:
     pages = load_document(path)
     chunks: list[Chunk] = []
     next_index = 0
@@ -213,6 +218,7 @@ def build_chunks(path: Path, source_hash: str) -> list[Chunk]:
             source_name=path.name,
             source_hash=source_hash,
             starting_index=next_index,
+            extra_metadata=extra_metadata,
         )
         chunks.extend(page_chunks)
         next_index += len(page_chunks)
@@ -224,7 +230,7 @@ def source_is_indexed(collection: chromadb.Collection, source_hash: str) -> bool
     return bool(result.get("ids"))
 
 
-def ingest_path(path: Path, source_hash: str, force: bool = False) -> tuple[int, str]:
+def ingest_path(path: Path, source_hash: str, force: bool = False, extra_metadata: dict | None = None) -> tuple[int, str]:
     collection = get_collection()
     if source_is_indexed(collection, source_hash):
         if not force:
@@ -233,7 +239,7 @@ def ingest_path(path: Path, source_hash: str, force: bool = False) -> tuple[int,
         if existing.get("ids"):
             collection.delete(ids=existing["ids"])
 
-    chunks = build_chunks(path, source_hash)
+    chunks = build_chunks(path, source_hash, extra_metadata=extra_metadata)
     if not chunks:
         return 0, "no readable text found"
 
@@ -351,7 +357,7 @@ def ask_manual(
 
 def answer_text(sentences: list[str]) -> str:
     if not sentences:
-        return "No grounded sentence-level answer was found. Review the returned source passages."
+        return "No grounded sentence-level answer was found. Review the returned retrieval evidence."
     return "\n".join(f"- {sentence}" for sentence in sentences)
 
 
@@ -359,11 +365,45 @@ def dllm_online(timeout: float = 1.0) -> bool:
     return bool(dllm_status(timeout=timeout)["online"])
 
 
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+
+
+def _is_local_endpoint(url: str) -> bool:
+    """Local carriers (Ollama) need no API key; remote carriers (OpenRouter, Groq) do."""
+    return (urlparse(url).hostname or "").lower() in _LOCAL_HOSTS
+
+
+def _carrier_name(url: str) -> str:
+    """Friendly label for the configured generative carrier, derived from its host."""
+    host = (urlparse(url).hostname or "").lower()
+    if not host:
+        return "Inference carrier"
+    if "openrouter" in host:
+        return "OpenRouter"
+    if "groq" in host:
+        return "Groq"
+    if host in _LOCAL_HOSTS:
+        return "Local (Ollama)"
+    return host
+
+
 def dllm_status(timeout: float = 1.0) -> dict:
     configured = bool(DEFAULT_DLLM_API_URL)
+    local = configured and _is_local_endpoint(DEFAULT_DLLM_API_URL)
+    has_key = bool(DEFAULT_DLLM_API_KEY)
+    carrier = _carrier_name(DEFAULT_DLLM_API_URL)
     online = False
-    detail = "Set CLS_DLLM_API_URL to enable dLLM API correction."
-    if configured:
+
+    if not configured:
+        detail = "Set CLS_DLLM_API_URL to enable the gpt-oss-120b answer."
+    elif not local and not has_key:
+        # Remote carrier wired in, but no key yet — the on-by-default toggle stays disabled
+        # until the key is present so searches don't 401 on every call.
+        detail = (
+            f"Carrier set to {carrier} but no API key found. Paste your key into cls.env "
+            "(CLS_DLLM_API_KEY), then relaunch."
+        )
+    else:
         try:
             request = urllib.request.Request(
                 f"{DEFAULT_DLLM_API_URL}/models",
@@ -372,16 +412,19 @@ def dllm_status(timeout: float = 1.0) -> dict:
             )
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 online = 200 <= response.status < 300
-                detail = "dLLM API reachable." if online else f"dLLM API returned HTTP {response.status}."
+                detail = f"{carrier} carrier reachable." if online else f"{carrier} returned HTTP {response.status}."
         except urllib.error.HTTPError as exc:
-            detail = f"dLLM API returned HTTP {exc.code}."
+            detail = f"{carrier} returned HTTP {exc.code}."
         except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as exc:
-            detail = f"dLLM API unreachable: {exc}"
+            detail = f"{carrier} unreachable: {exc}"
     return {
         "provider": "api",
+        "carrier": carrier,
         "base_url": DEFAULT_DLLM_API_URL,
         "model": DEFAULT_DLLM_MODEL,
         "configured": configured,
+        "has_key": has_key,
+        "local": local,
         "online": online,
         "detail": detail,
     }
@@ -402,7 +445,7 @@ def call_dllm_api(
     timeout: float = 60.0,
 ) -> str:
     if not DEFAULT_DLLM_API_URL:
-        raise RuntimeError("dLLM API is not configured. Set CLS_DLLM_API_URL.")
+        raise RuntimeError("Inference carrier is not configured. Set CLS_DLLM_API_URL.")
     if system:
         messages = [{"role": "system", "content": system}] + messages
     payload = json.dumps(
@@ -422,16 +465,16 @@ def call_dllm_api(
         with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"dLLM API call failed: {exc}") from exc
+        raise RuntimeError(f"Inference carrier call failed: {exc}") from exc
 
     choices = data.get("choices") or []
     if not choices:
-        raise RuntimeError("dLLM API returned no choices.")
+        raise RuntimeError("Inference carrier returned no choices.")
     message = choices[0].get("message") or {}
     content = message.get("content")
     if isinstance(content, str):
         return content
-    raise RuntimeError("dLLM API returned no text content.")
+    raise RuntimeError("Inference carrier returned no text content.")
 
 
 def generate_answer(
@@ -440,18 +483,26 @@ def generate_answer(
     *,
     model: str = DEFAULT_DLLM_MODEL,
     timeout: float = 60.0,
+    grounded: bool = True,
 ) -> str:
-    """Synthesize a short natural-language answer grounded in the retrieved context.
+    """Synthesize a short natural-language answer from the retrieved context.
 
     Opt-in generative RAG path: unlike `call_dllm_api` correction, this reads the question +
-    retrieved passages and writes a direct answer — but only from the provided context. Uses
-    the same OpenAI-compatible endpoint, so it works against Ollama, OpenRouter, Groq, etc.
+    retrieved passages and writes a direct answer. Uses the same OpenAI-compatible endpoint, so
+    it works against Ollama, OpenRouter, Groq, etc.
+
+    `grounded=True` (default) is the strict path: answer only from the context, and refuse with
+    "Not found in the indexed documents." when it does not cover the question. `grounded=False`
+    is the Hybrid path: the context is optional supporting material and the carrier may also
+    answer from its own general knowledge, so it can respond even with no retrieved rows.
     """
-    if not rows:
+    if grounded and not rows:
         return ""
+    system = ANSWER_SYSTEM if grounded else ASSIST_SYSTEM
+    user = answer_user(query, rows) if grounded else assist_user(query, rows)
     return call_dllm_api(
-        [{"role": "user", "content": answer_user(query, rows)}],
-        system=ANSWER_SYSTEM,
+        [{"role": "user", "content": user}],
+        system=system,
         model=model,
         timeout=timeout,
     ).strip()

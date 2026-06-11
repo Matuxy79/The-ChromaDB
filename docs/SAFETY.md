@@ -14,7 +14,7 @@ This prototype is not a safety authority. It is a local evidence assistant that 
 - vacuum failure
 - fire, medical, evacuation, injury
 
-When a trigger matches, the UI keeps the answer grounded in retrieved evidence and should point the user to beamline staff or emergency contacts when evidence is incomplete. Optional dLLM correction is still limited to mechanical text cleanup; it is not allowed to improvise procedures.
+When a trigger matches, the UI keeps the answer grounded in retrieved evidence and should point the user to beamline staff or emergency contacts when evidence is incomplete. Optional carrier cleanup is still limited to mechanical text cleanup; it is not allowed to improvise procedures.
 
 The interface should still be read conservatively:
 

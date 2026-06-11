@@ -17,7 +17,7 @@ import html
 import re
 from typing import List, Tuple
 
-from examples.cls_safety import SAFETY_TOPICS as _SAFETY_WORDS, detect_safety_topic
+from cls_backend.safety import SAFETY_TOPICS as _SAFETY_WORDS, detect_safety_topic
 
 
 # Categories in visible-spectrum (wavelength) order. Rose/orange sit up front
@@ -183,4 +183,7 @@ SUGGESTED_PROBLEMS: List[Tuple[str, str]] = [
     ("procedure", "IVU warm-up procedure steps"),
     ("specs", "IVU undulator energy range and optics"),
     ("contacts", "IVU beamline contacts and phone numbers"),
+    # Conceptual / natural-language starter — shines in Hybrid mode, where the carrier may
+    # answer from its own knowledge when the indexed manual doesn't explain the physics.
+    ("specs", "Explain how an undulator produces X-rays"),
 ]

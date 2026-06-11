@@ -15,7 +15,7 @@ class OllamaAPI:
         if not model:
             raise RuntimeError(
                 "OllamaAPI is an optional legacy adapter. Pass a model name explicitly; "
-                "the v0.9 dLLM path uses CLS_DLLM_API_URL and never pulls local chat models."
+                "the v1.0 carrier path uses CLS_DLLM_API_URL and never pulls local chat models."
             )
         try:
             from langchain_ollama import ChatOllama

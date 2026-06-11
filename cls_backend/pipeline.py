@@ -6,7 +6,7 @@ each other:
 
     1. UI/UX            — app.py (Streamlit)
     2. RAG+CAG backend  — THIS module (Retrieval Encoder + CAG + Evidence Store -> instant text)
-    3. dLLM corrector   — examples/cls_dllm.py (sparse, streaming)
+    3. Carrier cleanup  — examples/cls_dllm.py (sparse, guarded)
     4. Wiring/contract  — `instant_answer(...)` is the contract the UI consumes
 
 The backend does no LLM work: it encodes, checks the CAG cache, searches the Evidence Store,
@@ -22,7 +22,7 @@ import re
 from collections import Counter
 from typing import Iterable
 
-from examples.cls_spectrum import classify_query
+from cls_backend.spectrum import classify_query
 
 EMBED_DIM = 512
 
@@ -91,8 +91,47 @@ def lexical_terms(text: str) -> set[str]:
     }
 
 
+_CHUNK_HEADER = re.compile(
+    r"^Source:\s*(?P<source>.*?)\nSection:\s*(?P<section>.*?)\nPage:\s*(?P<page>.*?)\n\n",
+    re.S,
+)
+_ADJACENT_SPLIT = re.compile(r"\n\n--- adjacent segment ---\n\n")
+
+
+def _segment_metadata(segment: str, fallback: dict) -> tuple[str, dict]:
+    """Return a chunk segment body plus metadata from its embedded chunk header."""
+    meta = dict(fallback or {})
+    match = _CHUNK_HEADER.match(segment)
+    if not match:
+        return segment, meta
+
+    source = match.group("source").strip()
+    section = match.group("section").strip()
+    page = match.group("page").strip()
+    if source:
+        meta["source"] = source
+    if section:
+        meta["section"] = section
+    if page:
+        try:
+            meta["page"] = int(page)
+        except ValueError:
+            meta["page"] = page
+    return segment[match.end():], meta
+
+
+def iter_document_segments(row: dict) -> Iterable[tuple[str, dict]]:
+    """Yield each chunk body with its own metadata, preserving adjacent-page citations."""
+    document = row.get("document", "")
+    fallback = row.get("metadata", {}) or {}
+    for segment in _ADJACENT_SPLIT.split(document):
+        body, metadata = _segment_metadata(segment, fallback)
+        if body.strip():
+            yield body, metadata
+
+
 def extract_sentences(text: str) -> list[str]:
-    body = re.sub(r"^Source:.*?\nSection:.*?\nPage:.*?\n\n", "", text, flags=re.S)
+    body = _CHUNK_HEADER.sub("", text, count=1)
     normalized = re.sub(r"\s+", " ", body)
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+", normalized) if s.strip()]
 
@@ -101,10 +140,11 @@ def build_extractive_answer(query: str, rows: list[dict], max_sentences: int = 5
     terms = lexical_terms(query)
     candidates: list[tuple[int, float, str, dict]] = []
     for row in rows[:5]:
-        for sentence in extract_sentences(row["document"]):
-            overlap = len(terms & lexical_terms(sentence))
-            if overlap:
-                candidates.append((overlap, row["score"], sentence, row["metadata"]))
+        for segment, metadata in iter_document_segments(row):
+            for sentence in extract_sentences(segment):
+                overlap = len(terms & lexical_terms(sentence))
+                if overlap:
+                    candidates.append((overlap, row["score"], sentence, metadata))
 
     if not candidates:
         return []

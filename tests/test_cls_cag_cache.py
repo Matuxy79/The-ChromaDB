@@ -4,7 +4,7 @@ import uuid
 
 import chromadb
 
-from examples.cls_cag_cache import SemanticEvidenceCache
+from cls_backend.cag_cache import SemanticEvidenceCache
 
 
 class FakeEncoder:

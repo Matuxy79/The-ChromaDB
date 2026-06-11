@@ -6,43 +6,43 @@ A domain-specific Retrieval-Augmented and Cache-Augmented Generation (RAG+CAG) s
 
 This prototype separates indexing, shared retrieval, and frontend layers.
 
-Like DocuSearch, the default answer is **instant clean parsed text** from the RAG/CAG dual layer. No LLM runs in the hot answer path. The systems are kept separate so the UI, retrieval backend, API bridge, and optional dLLM correction do not tangle:
+Like DocuSearch, retrieval is instant and primary: the grounded **instant clean parsed text** from the RAG/CAG dual layer is always shown. On top of it, a generative answer is carried by an external OpenAI-compatible LLM — the **default carrier is OpenRouter · `openai/gpt-oss-120b`** — wired in as a single on/off toggle that is **ON by default once a carrier key is configured**. The systems are kept separate so the UI, retrieval backend, API bridge, and the LLM carrier do not tangle:
 
 | # | Component | Name | Where |
 | --- | --- | --- | --- |
 | 1 | Streamlit + OpenAI-compatible clients | **Dual frontend layers** | `app.py`, `/v1/chat/completions` |
 | 2 | FastAPI | **Shared API bridge** | `api.py` |
 | 3 | `HashEmbedder` + ChromaDB + CAG | **RAG+CAG instant backend** | `cls_service.py`, `examples/cls_pipeline.py` |
-| 4 | `gpt-oss-120b` external connection | **dLLM API endpoint** (optional, off by default) | `/v1/dllm/*`, `cls_service.py`, `examples/cls_dllm.py` |
+| 4 | OpenRouter · `openai/gpt-oss-120b` (default) | **Generative carrier** (single on/off, on by default when keyed) | `/v1/dllm/*`, `cls_service.py`, `examples/cls_dllm.py` |
 
 Within the backend, the **Retrieval Encoder** (`HashEmbedder`) encodes the query, the **CAG Layer** reuses prior evidence for near-identical questions, the **Evidence Store** (ChromaDB) is searched on a miss, and deterministic cleanup repairs extraction artifacts.
 
-> The base app does not download or start local language models. The optional dLLM path calls an OpenAI-compatible API endpoint only when configured and toggled on.
+> The base app does not download or start local language models — the only local model is the `HashEmbedder`. The generative answer calls the configured OpenAI-compatible carrier (default OpenRouter); with no key (or the toggle off) the app falls back to instant extractive text and stays fully offline-capable.
 
 ## Prerequisites
 
-The prototype does **not** require a heavyweight model download. The instant RAG/CAG path uses the deterministic `HashEmbedder` and works without `gpt-oss-120b`.
+The prototype does **not** require a heavyweight model download. The instant RAG/CAG path uses the deterministic `HashEmbedder` and works without any carrier.
 
-The optional LLM paths (artifact **correction** and generative **Answer with LLM**) are API-only and OpenAI-compatible — point them at OpenRouter, Ollama, Groq, etc. The easiest way is a gitignored `cls.env` that `launch_cls.sh` auto-sources:
+The generative answer is API-only and OpenAI-compatible. The **default carrier is OpenRouter · `openai/gpt-oss-120b`** — the URL and model are already baked in, so plug-and-play is just your key. The easiest way is a gitignored `cls.env` that `launch_cls.sh` auto-sources:
 
 ```bash
-cp cls.env.example cls.env   # then paste your API key
+cp cls.env.example cls.env   # then paste your OpenRouter key on the CLS_DLLM_API_KEY line
 ./launch_cls.sh
 ```
 
-Or export the vars directly:
+Only `CLS_DLLM_API_KEY` is required for the default carrier. To switch carriers, override the URL/model:
 
 ```bash
-export CLS_DLLM_API_URL="https://openrouter.ai/api/v1"   # or http://localhost:11434/v1 for Ollama
-export CLS_DLLM_API_KEY="sk-or-..."                      # omit for Ollama
-export CLS_DLLM_MODEL="openai/gpt-oss-120b"              # or e.g. llama3.2 on Ollama
+export CLS_DLLM_API_KEY="sk-or-..."                      # required for OpenRouter; omit for Ollama
+export CLS_DLLM_API_URL="https://openrouter.ai/api/v1"   # default; or http://localhost:11434/v1 for Ollama
+export CLS_DLLM_MODEL="openai/gpt-oss-120b"              # default; or e.g. llama3.2 on Ollama
 ```
 
 `CLS_DLLM_API_URL` should point to the external provider/runtime, not this app's own `http://127.0.0.1:8010/v1` API bridge.
 
-### Answer with LLM (generative RAG, opt-in)
+### Answer with gpt-oss-120b (generative RAG, on by default)
 
-By default the answer stays **instant extractive text** — no LLM. As **Admin** or **Scientist**, the sidebar's *✎ dLLM API* section adds a **💬 Answer with LLM** toggle. When on (and a backend is configured/online), each search synthesizes a short natural-language answer **strictly from the retrieved passages** (e.g. "great expectations author" → "Charles Dickens"), cites the passage numbers, and is flagged if it emits any number not found in the context. The grounded extractive answer is still shown directly below it for verification.
+Once a carrier key is configured, the generative answer is **on by default** for **Admin** and **Scientist** — the sidebar's *💬 gpt-oss-120b* section exposes a single on/off toggle to turn it off. Each search synthesizes a short natural-language answer **strictly from the retrieved passages** (e.g. "great expectations author" → "Charles Dickens"), cites the passage numbers, and is flagged if it emits any number not found in the context. The grounded extractive answer is still shown directly below it for verification. With no key (or the toggle off), the answer stays instant extractive text only. A secondary checkbox can additionally let the same carrier repair PDF extraction artifacts in the grounded bullets.
 
 ## Quick Launch
 
@@ -89,8 +89,8 @@ POST /v1/dllm/chat
 
 `/v1/chat/completions` exposes two models:
 
-- `cls-rag-cag-v0.9`: local RAG/CAG extractive answer.
-- `gpt-oss-120b` or `CLS_DLLM_MODEL`: proxy to the configured external dLLM API.
+- `cls-rag-cag-v1.0`: local RAG/CAG extractive answer.
+- `openai/gpt-oss-120b` or `CLS_DLLM_MODEL`: proxy to the configured external carrier.
 
 Example direct query:
 
@@ -112,31 +112,31 @@ The older `launch_indexer.sh` inbox daemon remains for batch experiments, but it
 ## What You'll See
 
 - A **Frontend bridge** sidebar panel showing whether Streamlit is using the embedded service or the FastAPI bridge.
-- A **dLLM API** status for the configured external model; if it is offline or unconfigured, the instant RAG/CAG answer still works.
+- A **carrier** status for the configured external model (default OpenRouter · `openai/gpt-oss-120b`); if it is offline or keyless, the instant RAG/CAG answer still works.
 - Per-file progress while uploaded files are indexed.
 - A silent deterministic query repair step for common beamline acronym spacing/typos.
-- An instant clean parsed answer by default, with source passages below it for audit.
-- An optional **dLLM API correction** toggle for extraction artifacts, backed only by the configured API endpoint.
+- A generative **gpt-oss-120b** answer on by default (Admin/Scientist) with a single on/off toggle, plus the grounded extraction and retrieval evidence rows below it for audit.
+- A secondary checkbox to additionally **correct extraction artifacts** in the grounded bullets, backed only by the configured carrier.
 
 ## Model Roles
 
 - **Indexing and search use `HashEmbedder`** so the IVU manual path works offline without an embedding-model download.
-- **Chat answers are extractive by default.** `gpt-oss-120b` is contacted only through the dLLM API for optional correction or direct dLLM chat.
+- **The grounded extractive answer is always shown.** On top of it, the generative `openai/gpt-oss-120b` answer (via the configured carrier, default OpenRouter) is on by default once a key is set, synthesized strictly from retrieved context.
 - **Query repair is deterministic.** It expands known CLS beamline acronyms before retrieval; no hidden language model is called.
-- **Legacy Ollama adapters are explicit-only.** They have no default model in v0.9 and are not installed by the main requirements file.
+- **Legacy Ollama adapters are explicit-only.** They have no default model in v1.0 and are not installed by the main requirements file (Ollama can still be used as a local carrier via `CLS_DLLM_API_URL`).
 
 ## Guide Docs
 
 - [Scientist guide](docs/USER_GUIDE.md)
 - [Architecture review](docs/ARCHITECTURE.md)
-- [dLLM API correction](docs/DLLM.md)
+- [Inference carrier cleanup](docs/DLLM.md)
 - [CLS safety flags](docs/SAFETY.md)
 
 ## Project Structure
 
 - `app.py`: Scientist-facing Streamlit application.
 - `api.py`: Shared FastAPI layer for Streamlit bridge mode and OpenAI-compatible clients.
-- `cls_service.py`: Shared ChromaDB, CAG, indexing, and dLLM API runtime wiring.
+- `cls_service.py`: Shared ChromaDB, CAG, indexing, and inference carrier runtime wiring.
 - `cls_config.py`: Version, paths, and API endpoint configuration.
 - `examples/`: CLS-specific retrieval, cleanup, correction, and legacy batch helpers.
 - `ragandcag/`: Legacy KnowledgeBase and vector DB abstractions.

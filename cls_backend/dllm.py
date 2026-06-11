@@ -1,17 +1,17 @@
-"""dLLM — a downstream, sparsely-activated correction LLM.
+"""Carrier cleanup — downstream, sparsely activated extraction correction.
 
 Inspiration: DocuSearch feels instant because it just retrieves and highlights — no
 model in the hot path. So here the *instant* answer is the grounded extractive text,
-shown with zero LLM latency. The dLLM ("downstream LLM") is deliberately lazy: it
-**usually does not activate**. It only wakes up at the very end, downstream of retrieval,
-when the instant text shows obvious extraction artifacts (PDF hyphenation breaks, truncated
-fragments, table/OCR soup). When it does fire, it *corrects* text — it never rewrites,
-summarises, or introduces facts, and every number and citation is preserved.
+shown with zero carrier latency. Carrier cleanup is deliberately lazy: it **usually does
+not activate**. It only wakes up at the very end, downstream of retrieval, when the instant
+text shows obvious extraction artifacts (PDF hyphenation breaks, truncated fragments,
+table/OCR soup). When it does fire, it *corrects* text — it never rewrites, summarises, or
+introduces facts, and every number and citation is preserved.
 
 This module is pure-Python and side-effect-free:
 - `needs_correction(sentences)` is the sparse activation gate (returns False for clean text).
 - `CORRECTION_SYSTEM` / `correction_user(...)` build the constrained correction prompt; the
-  app/API runs the actual one-shot dLLM API call and re-checks groundedness.
+  app/API runs the actual one-shot carrier call and re-checks groundedness.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ def correction_user(sentences: Iterable[str]) -> str:
 
 
 # --- Correction parsing + trust guards -------------------------------------------------- #
-# The dLLM API result is accepted only if it stayed faithful. Weak models can invent
+# The carrier cleanup result is accepted only if it stayed faithful. Weak models can invent
 # numbers or mangle citations, so both are checked before the UI shows a correction.
 
 
@@ -160,6 +160,40 @@ def answer_user(query: str, rows: list[dict]) -> str:
         f"Question: {query}\n\n"
         "Answer using only the context above, then cite the passage numbers you used."
     )
+
+
+# --- Hybrid "assist" answer (opt-in) ---------------------------------------------------- #
+# A looser sibling of ANSWER_SYSTEM, selected only when the user switches the carrier to
+# Hybrid mode. The retrieved passages become *optional* supporting material: the model
+# leads with them and cites [n] when they cover the question, but is free to answer from its
+# own general knowledge otherwise — it must never refuse with "Not found" and never dress
+# outside knowledge up as a document citation.
+
+ASSIST_SYSTEM = (
+    "You are a helpful assistant for the Canadian Light Source. You may use both the numbered "
+    "context passages provided and your own general knowledge.\n"
+    "Hard rules:\n"
+    "1. Prefer the context passages when they cover the question, and cite the ones you use by "
+    "their bracket numbers, e.g. [1], [2].\n"
+    "2. If the context does not cover the question, answer from your own general knowledge and "
+    'just answer naturally. Never reply "Not found in the indexed documents."\n'
+    "3. Never attribute outside knowledge to the documents and never invent bracket citations — "
+    "only cite passages you actually drew from.\n"
+    "4. Lead with a direct one- or two-sentence answer to the question.\n"
+    "5. When you quote the context, preserve its numbers, names, and identifiers exactly."
+)
+
+
+def assist_user(query: str, rows: list[dict]) -> str:
+    context = answer_context(rows)
+    if context:
+        return (
+            f"Supporting passages (use if relevant, otherwise answer from your own knowledge):\n"
+            f"{context}\n\n"
+            f"Question: {query}\n\n"
+            "Answer the question directly, citing any passages you used."
+        )
+    return f"Question: {query}\n\nAnswer the question directly."
 
 
 def answer_numbers_grounded(text: str, rows: list[dict]) -> bool:

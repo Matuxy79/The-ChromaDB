@@ -2,6 +2,5 @@ streamlit
 fastapi
 uvicorn[standard]
 chromadb
-langchain-text-splitters
 pandas
 pymupdf

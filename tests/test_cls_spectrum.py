@@ -1,6 +1,6 @@
 import unittest
 
-from examples.cls_spectrum import (
+from cls_backend.spectrum import (
     SPECTRUM,
     SUGGESTED_PROBLEMS,
     classify_query,

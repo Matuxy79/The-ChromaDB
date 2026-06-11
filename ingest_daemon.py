@@ -5,8 +5,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from examples.cls_ingest import ingest_document
-from examples.cls_kb_setup import build_cls_kb
+from cls_service import file_signature, ingest_path
 
 
 SUPPORTED_SUFFIXES = {".pdf", ".txt"}
@@ -69,7 +68,7 @@ def iter_documents(inbox: Path) -> list[Path]:
     )
 
 
-def process_document(kb, path: Path, args: argparse.Namespace) -> bool:
+def process_document(path: Path, args: argparse.Namespace) -> bool:
     metadata = {
         "colour_code": args.lane,
         "domain": args.domain,
@@ -78,24 +77,36 @@ def process_document(kb, path: Path, args: argparse.Namespace) -> bool:
     }
     metadata.update(load_sidecar_metadata(path))
 
+    source_hash = file_signature(path)
+
     try:
-        indexed = ingest_document(kb, str(path), metadata)
+        chunks_indexed, status = ingest_path(
+            path, source_hash, extra_metadata=metadata
+        )
     except Exception as exc:
         print(f"[failed] {path.name}: {exc}")
         move_with_sidecars(path, args.failed)
         return False
 
-    if not indexed:
+    if status == "no readable text found":
         print(f"[skipped] {path.name}: no extractable text")
         move_with_sidecars(path, args.failed)
         return False
 
-    print(f"[indexed] {path.name} lane={metadata.get('colour_code')} domain={metadata.get('domain')}")
+    if status == "already indexed":
+        print(f"[skipped] {path.name}: already indexed")
+        move_with_sidecars(path, args.processed)
+        return True
+
+    print(
+        f"[indexed] {path.name} lane={metadata.get('colour_code')} "
+        f"domain={metadata.get('domain')} chunks={chunks_indexed}"
+    )
     move_with_sidecars(path, args.processed)
     return True
 
 
-def run_once(kb, args: argparse.Namespace) -> int:
+def run_once(args: argparse.Namespace) -> int:
     documents = iter_documents(args.inbox)
     if not documents:
         print(f"[idle] No PDF/TXT files found in {args.inbox}")
@@ -103,7 +114,7 @@ def run_once(kb, args: argparse.Namespace) -> int:
 
     count = 0
     for document in documents:
-        if process_document(kb, document, args):
+        if process_document(document, args):
             count += 1
     return count
 
@@ -127,10 +138,8 @@ def main() -> None:
     args.processed.mkdir(parents=True, exist_ok=True)
     args.failed.mkdir(parents=True, exist_ok=True)
 
-    kb = build_cls_kb()
-
     while True:
-        indexed = run_once(kb, args)
+        indexed = run_once(args)
         if not args.watch:
             print(f"[done] Indexed {indexed} document(s).")
             return

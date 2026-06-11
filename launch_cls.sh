@@ -80,8 +80,8 @@ open_browser() {
 }
 
 load_env() {
-    # Auto-source local dev config (LLM API URL/key/model) so the generative
-    # "Answer with LLM" toggle works without exporting vars by hand. Gitignored.
+    # Auto-source local carrier config (API URL/key/model) so synthesis works
+    # without exporting vars by hand. Gitignored.
     if [ -f "$ROOT_DIR/cls.env" ]; then
         say "Loading config from cls.env"
         set -a
@@ -96,7 +96,7 @@ load_env
 pick_python
 ensure_venv
 ensure_requirements
-say "No local model checks are run. dLLM correction uses CLS_DLLM_API_URL when configured."
+say "No local model checks are run. Carrier synthesis/cleanup use CLS_DLLM_API_URL when configured."
 
 pick_port
 

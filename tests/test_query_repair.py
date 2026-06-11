@@ -1,6 +1,6 @@
 import unittest
 
-from examples.cls_query_repair import repair_query
+from cls_backend.query_repair import repair_query
 
 
 class QueryRepairTests(unittest.TestCase):

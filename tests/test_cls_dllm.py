@@ -1,6 +1,6 @@
 import unittest
 
-from examples.cls_dllm import (
+from cls_backend.dllm import (
     answer_context,
     answer_numbers_grounded,
     answer_user,
@@ -9,7 +9,7 @@ from examples.cls_dllm import (
     parse_bullets,
     validate_correction,
 )
-from examples.cls_spectrum import decorate
+from cls_backend.spectrum import decorate
 
 
 class GateStaysSparseTests(unittest.TestCase):

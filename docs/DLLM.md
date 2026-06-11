@@ -1,29 +1,29 @@
-# dLLM API — gpt-oss-120b Correction Connection
+# Inference Carrier Cleanup — gpt-oss-120b
 
 ## Why
 
-[DocuSearch](https://indsci.clsi.ca/docu/) feels instant because there is no language model in the hot path: it retrieves and highlights. This app works the same way by default. The answer is **instant clean parsed text** from the RAG/CAG layer, rendered with query-term highlighting and cited source passages.
+[DocuSearch](https://indsci.clsi.ca/docu/) feels instant because retrieval happens first: it retrieves and highlights. This app keeps that shape. The deterministic answer is **instant clean parsed text** from the RAG/CAG layer, rendered with query-term highlighting and cited retrieval evidence rows.
 
 Artifact cleanup such as PDF hyphenation breaks, stray spacing, and duplicate sentences is handled first by deterministic code (`clean_sentences` in `examples/cls_pipeline.py`).
 
-The optional **dLLM API** connection is downstream. It is off by default, and it is API-only in v0.9:
+In v1.0 the primary external model path is the **inference carrier**: OpenRouter + `openai/gpt-oss-120b` by default. When a key is present, the UI can synthesize a direct answer from retrieved evidence rows. The secondary **cleanup** checkbox is downstream, off by default, and API-only:
 
 - The launcher never starts Ollama.
 - The launcher never pulls `gpt-oss-120b`.
-- The UI toggle calls `/v1/dllm/chat`, which proxies to `CLS_DLLM_API_URL`.
-- If `CLS_DLLM_API_URL` is unset, the toggle stays offline and normal RAG/CAG answers still work.
+- The UI calls `/v1/dllm/chat`, which proxies to `CLS_DLLM_API_URL`.
+- If the carrier is offline or keyless, normal RAG/CAG extraction and retrieval evidence still work.
 
 ## Configuration
 
-Use an external OpenAI-compatible endpoint:
+Use an external OpenAI-compatible endpoint. OpenRouter + `openai/gpt-oss-120b` is already the default; for that carrier only the key is required:
 
 ```bash
-export CLS_DLLM_API_URL="https://your-dllm-endpoint.example/v1"
-export CLS_DLLM_API_KEY="..."
-export CLS_DLLM_MODEL="gpt-oss-120b"
+export CLS_DLLM_API_KEY="sk-or-..."
+# export CLS_DLLM_API_URL="https://openrouter.ai/api/v1"
+# export CLS_DLLM_MODEL="openai/gpt-oss-120b"
 ```
 
-`CLS_DLLM_API_URL` must be the dLLM provider/runtime base URL. Do not point it back at this app's own `http://127.0.0.1:8010/v1` bridge.
+`CLS_DLLM_API_URL` must be the carrier provider/runtime base URL. Do not point it back at this app's own `http://127.0.0.1:8010/v1` bridge.
 
 ## Where It Sits
 
@@ -33,7 +33,8 @@ question
   -> CAG Layer reuse or Evidence Store search (ChromaDB)
   -> deterministic clean parse
   -> instant answer shown immediately
-  -> optional dLLM API correction if toggled on and the gate fires
+  -> optional carrier synthesis from evidence rows
+  -> optional carrier cleanup if toggled on and the gate fires
 ```
 
 The codebase keeps the pieces separate:
@@ -42,7 +43,7 @@ The codebase keeps the pieces separate:
 | --- | --- | --- |
 | 1 | UI/UX | `app.py` |
 | 2 | RAG+CAG instant backend | `cls_service.py`, `examples/cls_pipeline.py` |
-| 3 | dLLM API corrector | `cls_service.py`, `examples/cls_dllm.py`, `/v1/dllm/*` |
+| 3 | Inference carrier synthesis + cleanup | `cls_service.py`, `examples/cls_dllm.py`, `/v1/dllm/*` |
 | 4 | CAG cache | `examples/cls_cag_cache.py` |
 
 ## Activation Gate
@@ -58,11 +59,11 @@ The codebase keeps the pieces separate:
 | long sentence cut mid-thought | completed a truncated fragment |
 | duplicated sentences | removed duplicated sentence |
 
-Most artifacts are already repaired by deterministic cleanup, so even with the toggle on the dLLM rarely has work to do.
+Most artifacts are already repaired by deterministic cleanup, so even with cleanup enabled the carrier rarely has work to do.
 
 ## Allowed Correction
 
-The dLLM API is constrained to mechanical correction only:
+Carrier cleanup is constrained to mechanical correction only:
 
 1. No rewriting, summarising, reordering, or adding information.
 2. Every number and every `[Source: ..., page ...]` citation must be preserved verbatim.
@@ -72,11 +73,11 @@ When the API returns, `validate_correction` checks `numbers_grounded` and `citat
 
 ## UI Provenance
 
-- `⚡ instant — clean parsed text from RAG/CAG, no LLM.` means no dLLM call happened.
-- `✎ dLLM corrected — <reason>.` means the toggle was on, the gate fired, and both guards passed.
-- `⚡ instant — dLLM drifted, kept the grounded extraction.` means the correction was rejected.
-- `⚡ instant — dLLM unavailable, kept the grounded extraction.` means the API call failed.
+- `💬 Carrier synthesis · OpenRouter · gpt-oss-120b` means the model synthesized from retrieval evidence rows.
+- `⚡ Deterministic extraction · RAG/CAG` means the cited extraction came from local retrieval and cleanup.
+- `✎ Extraction cleaned by <carrier> — <reason>.` means cleanup was on, the gate fired, and both guards passed.
+- `⚡ Carrier cleanup drifted/unavailable...` means the correction was rejected or failed, so deterministic extraction was kept.
 
 ## Encoder Caveat
 
-The dLLM API is independent of retrieval. Today the retrieval encoder is deterministic `HashEmbedder`, which keeps the prototype offline and small. A future semantic encoder could improve paraphrase matching, but it is not required for v0.9.
+The inference carrier is independent of retrieval. Today the retrieval encoder is deterministic `HashEmbedder`, which keeps the prototype offline and small. A future semantic encoder could improve paraphrase matching, but it is not required for v1.0.
