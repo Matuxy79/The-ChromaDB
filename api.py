@@ -33,6 +33,8 @@ class QueryRequest(BaseModel):
     top_k: int = Field(8, ge=1, le=20)
     cache_enabled: bool = True
     min_similarity: float = Field(0.97, ge=0.0, le=1.0)
+    metadata_filter: dict | None = None
+    debate_enabled: bool = False
 
 
 class ChatMessage(BaseModel):
@@ -47,6 +49,8 @@ class ChatCompletionRequest(BaseModel):
     top_k: int = Field(8, ge=1, le=20)
     cache_enabled: bool = True
     min_similarity: float = Field(0.97, ge=0.0, le=1.0)
+    metadata_filter: dict | None = None
+    debate_enabled: bool = False
 
 
 class DllmChatRequest(BaseModel):
@@ -61,6 +65,8 @@ def _query_payload(request: QueryRequest) -> dict[str, Any]:
         top_k=request.top_k,
         cache_enabled=request.cache_enabled,
         min_similarity=request.min_similarity,
+        metadata_filter=request.metadata_filter,
+        debate_enabled=request.debate_enabled,
     )
     return {
         "query": request.query,
@@ -144,6 +150,8 @@ def chat_completions(request: ChatCompletionRequest) -> dict[str, Any]:
             top_k=request.top_k,
             cache_enabled=request.cache_enabled,
             min_similarity=request.min_similarity,
+            metadata_filter=request.metadata_filter,
+            debate_enabled=request.debate_enabled,
         )
     )
     return {

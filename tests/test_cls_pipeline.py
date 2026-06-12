@@ -1,3 +1,4 @@
+import hashlib
 import unittest
 import uuid
 
@@ -5,13 +6,31 @@ import chromadb
 
 from cls_backend.cag_cache import SemanticEvidenceCache
 from cls_backend.pipeline import (
-    HashEmbedder,
+    EMBED_DIM,
+    OllamaEmbedder,
     build_extractive_answer,
     clean_sentence,
     clean_sentences,
     instant_answer,
     retrieve,
 )
+
+
+class TestEmbedder:
+    """Deterministic 768-dim embedder for unit tests (no Ollama required)."""
+
+    def embed(self, texts):
+        return [self._embed_one(text) for text in texts]
+
+    def _embed_one(self, text: str) -> list[float]:
+        vector = [0.0] * EMBED_DIM
+        digest = hashlib.sha256(text.lower().encode("utf-8")).digest()
+        for i, byte in enumerate(digest):
+            vector[i % EMBED_DIM] += byte / 255.0
+        norm = sum(v * v for v in vector) ** 0.5
+        if norm == 0:
+            return vector
+        return [v / norm for v in vector]
 
 
 def fresh_collection():
@@ -22,7 +41,7 @@ def fresh_collection():
 def make_cache():
     client = chromadb.EphemeralClient()
     col = client.create_collection(f"cache_{uuid.uuid4().hex}", metadata={"hnsw:space": "cosine"})
-    return SemanticEvidenceCache(col, HashEmbedder())
+    return SemanticEvidenceCache(col, TestEmbedder())
 
 
 def doc(name, section, page, body):
@@ -46,7 +65,7 @@ class CleanTextTests(unittest.TestCase):
 
 class RetrieveAndInstantAnswerTests(unittest.TestCase):
     def setUp(self):
-        self.embedder = HashEmbedder()
+        self.embedder = TestEmbedder()
         self.collection = fresh_collection()
         docs = [
             doc("IVU.pdf", "Contacts", 4, "The Undulator beamline phone is ext. 3832 for operators."),

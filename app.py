@@ -82,16 +82,15 @@ ROLES: dict[str, dict] = {
     },
 }
 ROLE_NAMES = list(ROLES)
-# Architecture: ONE active *local* model — the embedding Retrieval Encoder. Retrieval is instant
-# and primary (DocuSearch-style). The generative answer is carried by an external OpenAI-compatible
-# LLM — default carrier OpenRouter · openai/gpt-oss-120b — wired in as a single on/off toggle that
-# is ON by default once a carrier key is configured. It synthesizes strictly from the retrieved
-# context, and the grounded extractive answer is always shown beneath it for audit.
+# Architecture: ONE active *local* model — the embedding Retrieval Encoder (Ollama nomic-embed-text). 
+# Retrieval is primary, followed by an optional relevance-audit pass to reduce clutter.
+# The generative answer is carried by an external OpenAI-compatible LLM — default 
+# carrier OpenRouter · openai/gpt-oss-120b.
 DLLM_MODEL = DEFAULT_DLLM_MODEL
 
 
 st.set_page_config(
-    page_title=f"CLS IVU Manual Query · {APP_VERSION}",
+    page_title=f"CLS dsRAG Prototype · {APP_VERSION}",
     page_icon="🔬",
     layout="wide",
 )
@@ -158,7 +157,17 @@ def get_json(path: str, timeout: float = 2.0) -> dict:
         return {}
 
 
-def query_backend(query: str, top_k: int, cache_enabled: bool, min_similarity: float) -> dict:
+RESEARCH_SCOPES = {
+    "All indexed evidence": None,
+    "Outreach context": {"colour_code": "purple"},
+    "Science evidence": {"colour_code": "green"},
+    "Logistics notes": {"colour_code": "blue"},
+    "Operations procedures": {"colour_code": "orange"},
+    "Administration records": {"colour_code": "yellow"},
+}
+
+
+def query_backend(query: str, top_k: int, cache_enabled: bool, min_similarity: float, metadata_filter: dict | None = None, debate_enabled: bool = False) -> dict:
     if USE_API_BACKEND:
         return post_json(
             "/v1/query",
@@ -167,6 +176,8 @@ def query_backend(query: str, top_k: int, cache_enabled: bool, min_similarity: f
                 "top_k": top_k,
                 "cache_enabled": cache_enabled,
                 "min_similarity": min_similarity,
+                "metadata_filter": metadata_filter,
+                "debate_enabled": debate_enabled,
             },
         )
     return ask_manual(
@@ -174,6 +185,8 @@ def query_backend(query: str, top_k: int, cache_enabled: bool, min_similarity: f
         top_k=top_k,
         cache_enabled=cache_enabled,
         min_similarity=min_similarity,
+        metadata_filter=metadata_filter,
+        debate_enabled=debate_enabled,
     )
 
 
@@ -587,6 +600,10 @@ def _render_upload_section() -> None:
         st.caption(f"📎 {len(uploaded_files)} file(s) ready · {_human_size(total_bytes)} total.")
         with st.expander(f"Files queued for indexing ({len(sizes)})", expanded=False):
             st.markdown("\n".join(f"- {name} — {_human_size(size)}" for name, size in sizes))
+    
+    scope_tag = st.selectbox("Assign a research domain:", list(RESEARCH_SCOPES.keys()), index=2)
+    extra_meta = RESEARCH_SCOPES[scope_tag] or {}
+
     reindex_uploads = (
         st.checkbox(
             "Re-index files already in the store",
@@ -616,7 +633,7 @@ def _render_upload_section() -> None:
                     temp_path = Path(handle.name)
                 try:
                     count, message = ingest_path(
-                        temp_path, uploaded_signature(data), force=reindex_uploads
+                        temp_path, uploaded_signature(data), force=reindex_uploads, extra_metadata=extra_meta
                     )
                     if message == "already indexed":
                         tally["skipped"] += 1
@@ -654,7 +671,9 @@ def _render_upload_section() -> None:
 cag_enabled = True
 min_similarity = 0.97
 dllm_enabled = False
-synth_enabled = False
+# Synthesis defaults ON whenever the carrier is ready, even for tiers that never
+# see the toggle — the natural-language answer is the headline for every role.
+synth_enabled = dllm_api_online
 answer_mode = "Grounded"
 
 with st.sidebar:
@@ -672,14 +691,15 @@ with st.sidebar:
         f'<div class="cls-roletag">{role_meta["tagline"]}</div></div>',
         unsafe_allow_html=True,
     )
-    st.header("Frontend bridge")
-    st.caption(f"Streamlit → {'FastAPI' if USE_API_BACKEND else 'embedded service'}")
-    st.code(f"{API_URL}/v1/query\n{API_URL}/v1/chat/completions\n{API_URL}/v1/dllm/status", language="text")
-    dllm_state = "online" if dllm_api_online else "offline"
-    carrier_name = dllm_endpoint.get("carrier", "OpenRouter")
-    st.caption(
-        f"Inference carrier · {carrier_name} · {dllm_endpoint.get('model', DLLM_MODEL)} · {dllm_state}"
-    )
+
+    st.header("Research Scope")
+    st.caption("Metadata-gated retrieval for scientific, operational, and administrative context.")
+    selected_scope = st.radio("Active scope", list(RESEARCH_SCOPES.keys()), label_visibility="collapsed")
+    active_mfilter = RESEARCH_SCOPES[selected_scope]
+
+    st.header("Relevance Audit")
+    st.caption("Second-pass filtering for noisy retrieval sets before synthesis.")
+    debate_enabled = st.toggle("Enable evidence refinement", value=False)
 
     if role_can("index"):
         _render_corpus_admin()
@@ -810,7 +830,7 @@ with left:
         else:
             # System 2: the RAG+CAG backend returns the instant clean parsed answer.
             try:
-                result = query_backend(query, top_k, cag_enabled, min_similarity)
+                result = query_backend(query, top_k, cag_enabled, min_similarity, metadata_filter=active_mfilter, debate_enabled=debate_enabled)
             except RuntimeError as exc:
                 st.error(str(exc))
                 result = None
@@ -848,198 +868,159 @@ with left:
         else:
             st.session_state["eval_rows"] = evaluate_retrieval()
 
+def _answer_card_html(sentences: list[str], category: str, query: str, hue: str, glow: str) -> str:
+    """Build the deterministic extraction answer card as a single HTML block."""
+    card_open = f'<div class="cls-answer" style="--hue:{hue};--glow:{glow}">'
+    body = "<br>".join(f"• {decorate(s, category, query)}" for s in sentences)
+    return f"{card_open}{body}</div>"
+
+
+def render_answer_component(
+    stored_query: str,
+    rows: list[dict],
+    answer: list[str],
+    *,
+    dllm_endpoint: dict,
+    dllm_api_online: bool,
+    dllm_enabled: bool,
+    synth_enabled: bool,
+    answer_mode: str,
+) -> None:
+    """Single one-go answer component for the scientist / operator prompt.
+
+    The whole answer block is resolved (generative synthesis + deterministic extraction
+    cleanup) and then rendered in one update so operators see the complete response at
+    once instead of watching it stream or flash in.
+    """
+    top_score = rows[0]["score"]
+    category = st.session_state.get("last_category", "general")
+    meta = category_meta(category)
+    hue = meta["hue"]
+    glow = glow_css(hue, top_score)
+    carrier_name = dllm_endpoint.get("carrier", "OpenRouter")
+
+    st.markdown("### ✨ Answer")
+
+    # Resolve generative synthesis once, then cache in session state.
+    synth = st.session_state.get("last_synth", {"status": "off"})
+    synth_display_enabled = bool(dllm_api_online and synth_enabled)
+    if synth_display_enabled and synth.get("status") == "off":
+        synth = {"status": "pending", "text": None, "strict": synth.get("strict", answer_mode == "Grounded")}
+        st.session_state["last_synth"] = synth
+
+    run_strict = synth.get("strict", True)
+    if synth.get("status") == "pending" and synth_display_enabled:
+        with st.spinner("💬 Answering…"):
+            try:
+                synth_text = generate_answer(stored_query, rows, model=DLLM_MODEL, grounded=run_strict)
+                synth = (
+                    {"status": "done", "text": synth_text, "strict": run_strict,
+                     "grounded": answer_numbers_grounded(synth_text, rows)}
+                    if synth_text
+                    else {"status": "empty", "text": None, "strict": run_strict}
+                )
+            except Exception as exc:
+                synth = {"status": "error", "text": str(exc), "strict": run_strict}
+        st.session_state["last_synth"] = synth
+
+    if synth_display_enabled and synth.get("status") == "done" and synth.get("text"):
+        with st.container(border=True):
+            st.markdown(synth["text"])
+        if run_strict and not synth.get("grounded", True):
+            st.caption("⚠ Contains numbers not found verbatim in the retrieved context — "
+                       "verify against the retrieval evidence below.")
+    elif synth_display_enabled and synth.get("status") == "error":
+        st.caption(f"💬 Couldn't generate an answer — showing the extracted passages instead. ({synth.get('text')})")
+    elif synth_display_enabled and synth.get("status") == "empty":
+        st.caption("💬 The model returned no answer — showing the extracted passages instead.")
+
+    # Resolve any carrier cleanup of the extractive bullets once, then render the
+    # deterministic extraction card in a single placeholder update.
+    dllm = st.session_state.get("last_dllm", {"status": "dormant"})
+    extraction_sentences = answer
+    extraction_caption = (
+        "⚡ Deterministic extraction from retrieval evidence. No inference carrier modified this text."
+    )
+    if answer and dllm.get("status") == "pending" and dllm_api_online and dllm_enabled:
+        with st.spinner("✎ Cleaning extraction…"):
+            try:
+                corrected = correct_with_dllm_api(answer)
+                if corrected and validate_correction(" ".join(corrected), answer):
+                    extraction_sentences = corrected
+                    dllm = {"status": "corrected", "reason": dllm.get("reason"), "text": corrected}
+                    extraction_caption = f"✎ Extraction cleaned by {carrier_name} — {dllm.get('reason')}."
+                else:
+                    dllm = {"status": "reverted", "reason": dllm.get("reason"), "text": None}
+                    extraction_caption = "⚡ Carrier cleanup drifted, so the deterministic extraction was kept."
+            except Exception:
+                dllm = {"status": "reverted", "reason": dllm.get("reason"), "text": None}
+                extraction_caption = "⚡ Carrier cleanup unavailable, so the deterministic extraction was kept."
+        st.session_state["last_dllm"] = dllm
+    elif answer and dllm.get("status") == "corrected" and dllm.get("text"):
+        extraction_sentences = dllm["text"]
+        extraction_caption = f"✎ Extraction cleaned by {carrier_name} — {dllm.get('reason')}."
+
+    answer_placeholder = st.empty()
+    if extraction_sentences:
+        answer_placeholder.markdown(
+            '<span class="cls-badge" style="--hue:#6fd58a">⚡ Deterministic extraction · RAG/CAG</span>'
+            + _answer_card_html(extraction_sentences, category, stored_query, hue, glow)
+            + f'<div class="cls-mode-note">{extraction_caption}</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        synth_answered = synth.get("status") == "done" and bool(synth.get("text"))
+        if not synth_answered:
+            answer_placeholder.markdown(
+                '<div class="cls-mode-note">The indexed documents don\'t contain a direct passage for this — '
+                'the retrieval evidence below shows the closest matches.</div>',
+                unsafe_allow_html=True,
+            )
+
+    evidence_summary, mixed_evidence = retrieval_evidence_summary(rows)
+    st.markdown("### Retrieval evidence")
+    st.markdown(
+        '<div class="cls-evidence-strip">'
+        '<div class="cls-evidence-title">Chroma-ranked evidence rows, not model output</div>'
+        f'<div class="cls-evidence-copy">{evidence_summary}</div>'
+        f'<div class="cls-evidence-copy">Carrier citations like [1] refer to these row numbers; '
+        f'extractive citations name the source document and page directly.</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    if mixed_evidence:
+        st.caption(
+            "Mixed evidence set: retrieved rows came from multiple indexed documents. "
+            "For broad or misspelled prompts, tighten the query or lower Top-K for a cleaner evidence set."
+        )
+    hit_terms = stored_query
+    for index, row in enumerate(rows, start=1):
+        meta = row["metadata"]
+        label = (
+            f"Evidence {index} · {meta.get('source', 'source')}, "
+            f"page {meta.get('page', '?')} — {meta.get('section', 'section')}"
+        )
+        with st.expander(label, expanded=index <= 2):
+            st.markdown(
+                f'<div class="cls-snippet">{decorate(row["document"], category, hit_terms)}</div>',
+                unsafe_allow_html=True,
+            )
+
+
 with right:
     rows = st.session_state.get("last_rows", [])
     answer = st.session_state.get("last_answer", [])
     if rows:
-        top_score = rows[0]["score"]
-
-        # Spectral framing: question type picks the hue (the trustworthy signal); the
-        # hash embedder's absolute cosine score isn't a calibrated relevance, so it is
-        # not shown — it only sets the answer card's glow intensity.
-        category = st.session_state.get("last_category", "general")
-        meta = category_meta(category)
-        hue = meta["hue"]
-        glow = glow_css(hue, top_score)
-        card_open = f'<div class="cls-answer" style="--hue:{hue};--glow:{glow}">'
-
-        # CAG provenance: did this evidence come from the cache or a fresh search?
-        from_cache = st.session_state.get("last_from_cache", False)
-        similarity = st.session_state.get("last_similarity")
-        if from_cache:
-            sim_txt = f"{similarity:.2f}" if similarity is not None else "—"
-            cag_badge = (
-                '<span class="cls-badge" style="--hue:#6fd58a">'
-                f'♻ CAG hit · similarity {sim_txt}</span>'
-            )
-        else:
-            cag_badge = '<span class="cls-q">↯ fresh retrieval</span>'
-
-        carrier_name = dllm_endpoint.get("carrier", "OpenRouter")
-        model_name = display_model_name(DLLM_MODEL)
-        # Mode this query was run under (armed at submit time), so the badge stays truthful across reruns.
-        run_grounded = st.session_state.get("last_synth", {}).get("strict", True)
-        mode_label = "grounded" if run_grounded else "hybrid"
-        if dllm_api_online and synth_enabled:
-            inference_badge = (
-                '<span class="cls-badge" style="--hue:#6aa9ff">'
-                f'💬 Synthesis on · {mode_label} · {html.escape(model_name)}</span>'
-            )
-        else:
-            inference_badge = '<span class="cls-q">💬 synthesis off — extraction only</span>'
-
-        st.markdown("### ✨ Answer")
-        st.markdown(
-            '<div class="cls-statusline">'
-            f'<span>Question type · </span><span class="cls-badge" style="--hue:{hue}">'
-            f'{meta["glyph"]} {meta["label"]}</span>'
-            f'{cag_badge}'
-            f'{inference_badge}'
-            '</div>',
-            unsafe_allow_html=True,
+        render_answer_component(
+            st.session_state.get("last_query", ""),
+            rows,
+            answer,
+            dllm_endpoint=dllm_endpoint,
+            dllm_api_online=dllm_api_online,
+            dllm_enabled=dllm_enabled,
+            synth_enabled=synth_enabled,
+            answer_mode=answer_mode,
         )
-
-        stored_query = st.session_state.get("last_query", "")
-
-        def card(sentences: list[str]) -> str:
-            body = "<br>".join(f"• {decorate(s, category, stored_query)}" for s in sentences)
-            return f"{card_open}{body}</div>"
-
-        # Generative RAG answer (on by default when the carrier is ready): synthesised from the
-        # retrieved context and shown as the headline answer above the trusted extractive bullets.
-        # Runs once per query, then caches
-        # the text in session state so reruns (chip clicks, toggles) don't re-call the API.
-        synth = st.session_state.get("last_synth", {"status": "off"})
-        synth_display_enabled = bool(dllm_api_online and synth_enabled)
-        if synth_display_enabled and synth.get("status") == "off":
-            synth = {"status": "pending", "text": None, "strict": synth.get("strict", answer_mode == "Grounded")}
-            st.session_state["last_synth"] = synth
-
-        # Mode this query was armed under: drives grounding strictness and how much provenance we surface.
-        run_strict = synth.get("strict", True)
-
-        if synth.get("status") == "pending" and synth_display_enabled:
-            with st.spinner("💬 Synthesizing answer…"):
-                try:
-                    synth_text = generate_answer(stored_query, rows, model=DLLM_MODEL, grounded=run_strict)
-                    synth = (
-                        {"status": "done", "text": synth_text, "strict": run_strict,
-                         "grounded": answer_numbers_grounded(synth_text, rows)}
-                        if synth_text
-                        else {"status": "empty", "text": None, "strict": run_strict}
-                    )
-                except Exception as exc:
-                    synth = {"status": "error", "text": str(exc), "strict": run_strict}
-            st.session_state["last_synth"] = synth
-
-        if synth_display_enabled and synth.get("status") == "done" and synth.get("text"):
-            cite_hint = (
-                '<span class="cls-q">citations [n] map to retrieval evidence rows below</span>'
-                if run_strict else ""
-            )
-            st.markdown(
-                '<div class="cls-statusline">'
-                f'<span class="cls-badge" style="--hue:#6aa9ff">💬 Carrier synthesis · '
-                f'{html.escape(carrier_name)} · {html.escape(model_name)}</span>'
-                f'{cite_hint}'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-            with st.container(border=True):
-                st.markdown(synth["text"])
-            if run_strict:
-                if not synth.get("grounded", True):
-                    st.caption("⚠ Contains numbers not found verbatim in the retrieved context — "
-                               "verify against the retrieval evidence below.")
-                st.caption(
-                    f"💬 Generated by the {carrier_name} inference carrier from the retrieval evidence; "
-                    "the deterministic extraction follows for audit."
-                )
-            else:
-                st.caption(
-                    f"💬 Hybrid answer from the {carrier_name} carrier — uses your indexed documents "
-                    "when they're relevant, otherwise the model's own knowledge."
-                )
-        elif synth_display_enabled and synth.get("status") == "error":
-            st.caption(f"💬 Carrier synthesis failed — showing deterministic extraction. ({synth.get('text')})")
-        elif synth_display_enabled and synth.get("status") == "empty":
-            st.caption("💬 Carrier returned no synthesis — showing deterministic extraction.")
-
-        if answer:
-            dllm = st.session_state.get("last_dllm", {"status": "dormant"})
-            st.markdown(
-                '<span class="cls-badge" style="--hue:#6fd58a">⚡ Deterministic extraction · RAG/CAG</span>',
-                unsafe_allow_html=True,
-            )
-            placeholder = st.empty()
-
-            if dllm.get("status") == "corrected" and dllm.get("text"):
-                # Settled from a prior run — render directly, no flash, no model call.
-                placeholder.markdown(card(dllm["text"]), unsafe_allow_html=True)
-                st.caption(f"✎ Extraction cleaned by {carrier_name} — {dllm.get('reason')}.")
-            elif dllm.get("status") == "pending" and dllm_api_online and dllm_enabled:
-                # Instant text appears first; the carrier then corrects it in place.
-                # Re-checked for grounding at the end; reverts on drift.
-                placeholder.markdown(card(answer), unsafe_allow_html=True)
-                try:
-                    corrected = correct_with_dllm_api(answer)
-                    if corrected and validate_correction(" ".join(corrected), answer):
-                        placeholder.markdown(card(corrected), unsafe_allow_html=True)
-                        st.session_state["last_dllm"] = {
-                            "status": "corrected", "reason": dllm.get("reason"), "text": corrected
-                        }
-                        st.caption(f"✎ Extraction cleaned by {carrier_name} — {dllm.get('reason')}.")
-                    else:
-                        placeholder.markdown(card(answer), unsafe_allow_html=True)
-                        st.session_state["last_dllm"] = {"status": "reverted", "reason": dllm.get("reason"), "text": None}
-                        st.caption("⚡ Carrier cleanup drifted, so the deterministic extraction was kept.")
-                except Exception:
-                    placeholder.markdown(card(answer), unsafe_allow_html=True)
-                    st.session_state["last_dllm"] = {"status": "reverted", "reason": dllm.get("reason"), "text": None}
-                    st.caption("⚡ Carrier cleanup unavailable, so the deterministic extraction was kept.")
-            else:
-                placeholder.markdown(card(answer), unsafe_allow_html=True)
-                st.caption(
-                    "⚡ Deterministic extraction from retrieval evidence. No inference carrier modified this text."
-                )
-        else:
-            synth_answered = (not run_strict) and synth.get("status") == "done" and bool(synth.get("text"))
-            if synth_answered:
-                st.caption(
-                    "⚡ No verbatim passage matched — the Hybrid answer above came from the carrier's "
-                    "own knowledge. Retrieval evidence below for reference."
-                )
-            else:
-                st.warning("No strong sentence-level extraction found. Review the retrieval evidence below.")
-
-        evidence_summary, mixed_evidence = retrieval_evidence_summary(rows)
-        st.markdown("### Retrieval evidence")
-        st.markdown(
-            '<div class="cls-evidence-strip">'
-            '<div class="cls-evidence-title">Chroma-ranked evidence rows, not model output</div>'
-            f'<div class="cls-evidence-copy">{evidence_summary}</div>'
-            f'<div class="cls-evidence-copy">Carrier citations like [1] refer to these row numbers; '
-            f'extractive citations name the source document and page directly.</div>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-        if mixed_evidence:
-            st.caption(
-                "Mixed evidence set: retrieved rows came from multiple indexed documents. "
-                "For broad or misspelled prompts, tighten the query or lower Top-K for a cleaner evidence set."
-            )
-        hit_terms = stored_query
-        for index, row in enumerate(rows, start=1):
-            meta = row["metadata"]
-            label = (
-                f"Evidence {index} · {meta.get('source', 'source')}, "
-                f"page {meta.get('page', '?')} — {meta.get('section', 'section')}"
-            )
-            with st.expander(label, expanded=index <= 2):
-                st.markdown(
-                    f'<div class="cls-snippet">{decorate(row["document"], category, hit_terms)}</div>',
-                    unsafe_allow_html=True,
-                )
     else:
         render_evidence_store(evidence_breakdown(get_collection()))
 

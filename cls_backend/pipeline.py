@@ -6,52 +6,64 @@ each other:
 
     1. UI/UX            — app.py (Streamlit)
     2. RAG+CAG backend  — THIS module (Retrieval Encoder + CAG + Evidence Store -> instant text)
-    3. Carrier cleanup  — examples/cls_dllm.py (sparse, guarded)
+    3. Carrier cleanup  — cls_backend/dllm.py (sparse, guarded)
     4. Wiring/contract  — `instant_answer(...)` is the contract the UI consumes
 
-The backend does no LLM work: it encodes, checks the CAG cache, searches the Evidence Store,
-and assembles a grounded extractive answer. All functions are pure / dependency-injected
-(collection, cache, encoder are passed in) so they are testable without app state.
+The backend does no LLM work by default: it encodes, checks the CAG cache, searches the
+Evidence Store, and assembles a grounded extractive answer. All functions are pure /
+dependency-injected (collection, cache, encoder are passed in) so they are testable without
+app state.
+
+When `debate_enabled=True`, an optional second self-debate loop uses the configured
+inference carrier to audit retrieved chunks for relevance before answer generation.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
+import urllib.error
+import urllib.request
 from collections import Counter
-from typing import Iterable
+from typing import Any, Iterable
 
 from cls_backend.spectrum import classify_query
+from cls_config import DEFAULT_DLLM_API_KEY, DEFAULT_DLLM_API_URL, DEFAULT_DLLM_MODEL
 
-EMBED_DIM = 512
+EMBED_DIM = 768
 
 
-class HashEmbedder:
-    """Retrieval Encoder: small deterministic embedder for offline manual retrieval."""
+class OllamaEmbedder:
+    """Retrieval Encoder: Ollama-based embedder using nomic-embed-text."""
 
-    def __init__(self, dimensions: int = EMBED_DIM) -> None:
-        self.dimensions = dimensions
+    def __init__(self, model: str = "nomic-embed-text", base_url: str = "http://localhost:11434") -> None:
+        self.model = model
+        self.base_url = base_url.rstrip("/")
 
     def embed(self, texts: Iterable[str]) -> list[list[float]]:
         return [self._embed_one(text) for text in texts]
 
     def _embed_one(self, text: str) -> list[float]:
-        tokens = re.findall(r"[a-zA-Z0-9][a-zA-Z0-9_\-/\.]*", text.lower())
-        features: Counter[str] = Counter(tokens)
-        features.update(f"{a} {b}" for a, b in zip(tokens, tokens[1:]))
-
-        vector = [0.0] * self.dimensions
-        for feature, count in features.items():
-            digest = hashlib.blake2b(feature.encode("utf-8"), digest_size=8).digest()
-            bucket = int.from_bytes(digest[:4], "little") % self.dimensions
-            sign = 1.0 if digest[4] % 2 == 0 else -1.0
-            vector[bucket] += sign * (1.0 + math.log(count))
-
-        norm = math.sqrt(sum(value * value for value in vector))
-        if norm == 0:
-            return vector
-        return [value / norm for value in vector]
+        payload = json.dumps({"model": self.model, "prompt": text}).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self.base_url}/api/embeddings",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10.0) as response:
+                data = json.loads(response.read().decode("utf-8"))
+                embedding = data.get("embedding")
+                if isinstance(embedding, list) and len(embedding) == EMBED_DIM:
+                    return embedding
+        except Exception:
+            pass
+        # Fallback to zero vector to avoid crashing the pipeline; callers should surface
+        # an offline/embedder warning in the UI when all hits have zero similarity.
+        return [0.0] * EMBED_DIM
 
 
 def collection_count(collection) -> int:
@@ -229,15 +241,24 @@ def merge_adjacent_segments(rows: list[dict]) -> list[dict]:
     return merged
 
 
-def retrieve(collection, embedder, query: str, n_results: int = 8) -> list[dict]:
+def retrieve(
+    collection,
+    embedder,
+    query: str,
+    n_results: int = 8,
+    metadata_filter: dict | None = None,
+) -> list[dict]:
     """Vector search against the Evidence Store. Returns scored rows (empty if unindexed)."""
     if collection_count(collection) == 0:
         return []
-    result = collection.query(
-        query_embeddings=embedder.embed([query]),
-        n_results=n_results,
-        include=["documents", "metadatas", "distances"],
-    )
+    query_params: dict[str, Any] = {
+        "query_embeddings": embedder.embed([query]),
+        "n_results": n_results,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if metadata_filter:
+        query_params["where"] = metadata_filter
+    result = collection.query(**query_params)
     rows: list[dict] = []
     documents = result.get("documents", [[]])[0]
     metadatas = result.get("metadatas", [[]])[0]
@@ -245,6 +266,61 @@ def retrieve(collection, embedder, query: str, n_results: int = 8) -> list[dict]
     for document, metadata, distance in zip(documents, metadatas, distances):
         score = max(0.0, min(1.0, 1.0 - float(distance)))
         rows.append({"document": document, "metadata": metadata or {}, "distance": distance, "score": score})
+    return rows
+
+
+def _dllm_headers() -> dict[str, str]:
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if DEFAULT_DLLM_API_KEY:
+        headers["Authorization"] = f"Bearer {DEFAULT_DLLM_API_KEY}"
+    return headers
+
+
+def self_debate_refine(query: str, rows: list[dict], model: str = DEFAULT_DLLM_MODEL) -> list[dict]:
+    """Second relevance-audit loop: uses the configured inference carrier to prune
+    irrelevant chunks before synthesis.
+    """
+    if not rows:
+        return []
+    if not DEFAULT_DLLM_API_URL:
+        return rows
+
+    context_str = ""
+    for index, row in enumerate(rows):
+        document = row.get("document", "")[:500]
+        context_str += f"ID {index}: {document}\n\n"
+
+    prompt = (
+        "You are a retrieval auditor for a scientific document system. Keep only chunks "
+        "that directly support answering the query; discard off-topic or low-signal chunks.\n"
+        f"Query: {query}\n\n"
+        f"Chunks:\n{context_str}\n"
+        "Respond with a JSON list of the IDs that are HIGHLY RELEVANT and should be kept. "
+        "Example: [0, 2, 5]. Exclude anything that does not directly help answer the query. "
+        "Output ONLY the JSON list."
+    )
+
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        f"{DEFAULT_DLLM_API_URL}/chat/completions",
+        data=payload,
+        headers=_dllm_headers(),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30.0) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        keep_ids = json.loads(content)
+        if isinstance(keep_ids, list):
+            refined = [rows[i] for i in keep_ids if isinstance(i, int) and 0 <= i < len(rows)]
+            return refined if refined else rows[:1]
+    except Exception:
+        pass
     return rows
 
 
@@ -256,11 +332,13 @@ def instant_answer(
     embedder,
     top_k: int = 8,
     cache_enabled: bool = True,
+    metadata_filter: dict | None = None,
+    debate_enabled: bool = False,
 ) -> dict:
     """The contract the UI consumes: query -> grounded instant answer + provenance.
 
     Checks the CAG Layer first (evidence reuse), falls back to an Evidence Store search,
-    then assembles the extractive answer. No LLM is involved.
+    then assembles the extractive answer. No LLM is involved unless debate_enabled=True.
     """
     category = classify_query(query)
     sig = corpus_signature(collection)
@@ -269,8 +347,10 @@ def instant_answer(
     if hit:
         rows, from_cache, similarity = hit["rows"], True, hit["similarity"]
     else:
-        rows = retrieve(collection, embedder, query, n_results=top_k)
+        rows = retrieve(collection, embedder, query, n_results=top_k, metadata_filter=metadata_filter)
         from_cache, similarity = False, None
+        if debate_enabled and rows:
+            rows = self_debate_refine(query, rows)
         if cache_enabled and rows:
             cache.store(query, rows, sig, category=category, top_k=top_k)
 

@@ -9,8 +9,8 @@ MANUAL_DIR = APP_ROOT / "Training for perfect in ui graded"
 DEFAULT_MANUAL = MANUAL_DIR / "IVU beamline manual - Apr 10 2026.pdf"
 CHROMA_DIR = APP_ROOT / "chroma_store"
 
-COLLECTION_NAME = "cls_ivu_manual_hash_v1"            # Evidence Store
-CACHE_COLLECTION_NAME = "cls_cag_evidence_cache_v1"   # CAG Layer
+COLLECTION_NAME = "cls_v1_dsrag_evidence"            # Evidence Store (768d)
+CACHE_COLLECTION_NAME = "cls_v1_dsrag_cag_cache"   # CAG Layer (768d)
 CHUNK_TARGET_CHARS = 1100
 CHUNK_OVERLAP_CHARS = 180
 

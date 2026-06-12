@@ -120,11 +120,11 @@ def validate_correction(text: str, sentences: list[str]) -> bool:
     return numbers_grounded(text, sentences) and citations_preserved(text, sentences)
 
 
-# --- Generative RAG answer (opt-in) ----------------------------------------------------- #
-# A second, *opt-in* LLM mode distinct from correction: instead of only repairing artifacts,
-# it synthesises a short natural-language answer to the user's question — but strictly from
-# the retrieved context passages, never outside knowledge. Off by default; the instant
-# extractive answer stays the trusted ground truth shown alongside it.
+# --- Generative RAG answer -------------------------------------------------------------- #
+# A second LLM mode distinct from correction: instead of only repairing artifacts, it
+# synthesises a natural-language answer to the user's question. Facts must come from the
+# retrieved context passages (component-wise honest: answer what the context covers, say
+# plainly what it doesn't); the extractive answer stays alongside it as the audit trail.
 
 _CHUNK_HEADER = re.compile(r"^Source:.*?\nSection:.*?\nPage:.*?\n\n", re.S)
 
@@ -144,13 +144,19 @@ def answer_context(rows: list[dict], max_passages: int = 6, max_chars: int = 900
 
 ANSWER_SYSTEM = (
     "You are a retrieval-grounded assistant for the Canadian Light Source. Answer the "
-    "user's question using ONLY the numbered context passages provided.\n"
+    "user's question naturally and directly, using the numbered context passages as your "
+    "only source of facts about the facility.\n"
     "Hard rules:\n"
-    "1. Use only facts found in the context. Never use outside knowledge or guess.\n"
-    '2. If the answer is not in the context, reply exactly: "Not found in the indexed documents."\n'
-    "3. Lead with a direct one- or two-sentence answer to the question.\n"
-    "4. Cite the passages you used by their bracket numbers, e.g. [1], [2].\n"
-    "5. Preserve numbers, names, and identifiers exactly as written in the context."
+    "1. Factual claims (procedures, settings, contacts, specifications) must come from the "
+    "context passages; cite the ones you use by their bracket numbers, e.g. [1], [2].\n"
+    "2. Be honest component by component: answer the parts of the question the context does "
+    "cover, and say plainly which parts it does not. Never refuse the whole question just "
+    "because one part is missing.\n"
+    "3. Greetings and purely conversational messages get a natural conversational reply — "
+    "no citations needed.\n"
+    "4. Never invent facts and never attribute outside knowledge to the documents.\n"
+    "5. Preserve numbers, names, and identifiers exactly as written in the context.\n"
+    "6. Lead with a direct one- or two-sentence answer to the question."
 )
 
 
@@ -158,7 +164,8 @@ def answer_user(query: str, rows: list[dict]) -> str:
     return (
         f"Context passages:\n{answer_context(rows)}\n\n"
         f"Question: {query}\n\n"
-        "Answer using only the context above, then cite the passage numbers you used."
+        "Answer the question directly. Ground every factual claim in the context above with "
+        "[n] citations, and say plainly if some part of the question isn't covered."
     )
 
 

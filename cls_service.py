@@ -26,7 +26,7 @@ from cls_config import (
 )
 from cls_backend.cag_cache import SemanticEvidenceCache
 from cls_backend.dllm import ANSWER_SYSTEM, ASSIST_SYSTEM, answer_user, assist_user
-from cls_backend.pipeline import EMBED_DIM, HashEmbedder, collection_count, instant_answer, retrieve
+from cls_backend.pipeline import EMBED_DIM, OllamaEmbedder, collection_count, instant_answer, retrieve
 
 
 @dataclass(frozen=True)
@@ -37,18 +37,18 @@ class Chunk:
 
 
 _RESOURCE_LOCK = RLock()
-_embedder: HashEmbedder | None = None
+_embedder: OllamaEmbedder | None = None
 _chroma_client: Any | None = None
 _collection: chromadb.Collection | None = None
 _cache_collection: chromadb.Collection | None = None
 _cache: SemanticEvidenceCache | None = None
 
 
-def get_embedder() -> HashEmbedder:
+def get_embedder() -> OllamaEmbedder:
     global _embedder
     with _RESOURCE_LOCK:
         if _embedder is None:
-            _embedder = HashEmbedder()
+            _embedder = OllamaEmbedder()
         return _embedder
 
 
@@ -342,6 +342,8 @@ def ask_manual(
     top_k: int = 8,
     cache_enabled: bool = True,
     min_similarity: float = 0.97,
+    metadata_filter: dict | None = None,
+    debate_enabled: bool = False,
 ) -> dict:
     cache = get_cache()
     cache.distance_max = 1.0 - min_similarity
@@ -352,6 +354,8 @@ def ask_manual(
         embedder=get_embedder(),
         top_k=top_k,
         cache_enabled=cache_enabled,
+        metadata_filter=metadata_filter,
+        debate_enabled=debate_enabled,
     )
 
 

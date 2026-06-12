@@ -6,9 +6,9 @@ spectrum (rose/orange anchor the most common operations questions), attach a
 symbolic glyph, and highlight semantic entities in the text.
 
 This is a *presentation* layer only — it never touches retrieval, embeddings, or
-the facts in an answer. Colour-as-metadata mirrors the existing Prism-lane idea
-in `examples/cls_filters.py`; the safety category reuses the audited keyword set
-in `examples/cls_safety.py` rather than duplicating it.
+the facts in an answer. Colour metadata can also be used by the research-scope
+filters; the safety category reuses the audited keyword set in `cls_backend/safety.py`
+rather than duplicating it.
 """
 
 from __future__ import annotations
