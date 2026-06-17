@@ -70,10 +70,11 @@ def needs_correction(sentences: Iterable[str]) -> Tuple[bool, Optional[str]]:
 
 
 CORRECTION_SYSTEM = (
-    "You are a downstream text corrector for the Canadian Light Source IVU beamline manual. "
-    "You receive already-extracted, factual sentences that contain minor artifacts from PDF "
-    "extraction. Fix ONLY mechanical issues: rejoin hyphenation breaks, repair obvious spacing, "
-    "drop leftover header fragments, and complete a sentence that was cut mid-word.\n"
+    "You are a downstream text corrector for Canadian Light Source research documents. "
+    "You receive already-extracted, factual sentences that contain minor artifacts from PDF, "
+    "web, or office-document extraction. Fix ONLY mechanical issues: rejoin hyphenation breaks, "
+    "repair obvious spacing, drop leftover header fragments, and complete a sentence that was "
+    "cut mid-word.\n"
     "Hard rules:\n"
     "1. Do NOT rewrite, summarise, reorder, or add information. Same facts, same order.\n"
     "2. Preserve every number and every '[Source: ..., page ...]' citation verbatim.\n"
@@ -208,3 +209,108 @@ def answer_numbers_grounded(text: str, rows: list[dict]) -> bool:
     appear in the retrieved context (otherwise the UI flags it as unverified)."""
     context = " ".join(row.get("document", "") for row in rows)
     return numbers_grounded(text, [context])
+
+
+# --- Ask Lane parrot -------------------------------------------------------------------- #
+# A tiny local model (qwen2.5:0.5b via Ollama) that rephrases the already-grounded extractive
+# sentences into one natural-language paragraph. Deliberately a parrot, not a reasoner: it
+# adds nothing, infers nothing, and is held to the same numbers_grounded guard as the carrier.
+# If the rephrase drifts (invents a number) the caller falls back to the extractive bullets.
+
+_PARROT_CITE = re.compile(r"\s*\[Source:[^\]]*\]\s*")
+
+PARROT_SYSTEM = (
+    "You rewrite factual notes into one short, natural paragraph for a reader.\n"
+    "You are a parrot, not a thinker: use ONLY the facts in the notes. Never add, infer, "
+    "explain, or reason beyond what is written.\n"
+    "Hard rules:\n"
+    "1. Use only information present in the notes. Add nothing.\n"
+    "2. Keep every number, name, unit, and identifier exactly as written.\n"
+    "3. Do not write bracket citations or '[Source: ...]' tags.\n"
+    "4. One to three plain sentences. Output only the paragraph, nothing else."
+)
+
+
+def parrot_user(sentences: Iterable[str]) -> str:
+    notes = []
+    for sentence in sentences:
+        clean = _PARROT_CITE.sub(" ", sentence).strip()
+        if clean:
+            notes.append(f"- {clean}")
+    body = "\n".join(notes)
+    return f"Notes:\n{body}\n\nRewrite these notes as one short, natural paragraph."
+
+
+def parrot_grounded(prose: str, sentences: list[str]) -> bool:
+    """Parrot output is trusted only if it invented no multi-digit numbers."""
+    return numbers_grounded(prose, sentences)
+
+
+# --- Wernicke relation guard ------------------------------------------------------------ #
+# The number guard catches invented digits but NOT relation-drift: the parrot can keep a real
+# number while binding it to the wrong thing — "floor coordinator at ext. 3639" became
+# "elevator number 3639". Both numbers are real, so numbers_grounded passes it.
+#
+# This deterministic check scrutinises the content words that *hug a protected value* (a
+# multi-digit number / ext code) in the prose and flags any that are absent from the evidence
+# vocabulary — the signature of a hallucinated relation. It is intentionally local and
+# rule-based (trusting another model to judge meaning would inherit the same drift) and, like
+# the safety detector, conservative: a false positive just surfaces a "verify" banner while
+# the grounded base stays the source of truth; a false negative would let drift through.
+
+_PROTECTED_VALUE = re.compile(r"\d{2,}")  # multi-digit numbers, ext codes, identifiers
+# Alphanumeric runs with internal -/. only (so "access." -> "access", "ext." -> "ext").
+_WORD = re.compile(r"[A-Za-z0-9]+(?:[-/.][A-Za-z0-9]+)*")
+_DRIFT_STOP = {
+    # function words
+    "the", "a", "an", "and", "or", "of", "to", "for", "in", "on", "at", "by", "is", "are",
+    "was", "were", "be", "can", "via", "with", "this", "that", "it", "as", "from", "into",
+    "ext", "no", "number",
+    # generic relation/locative verbs the parrot swaps freely — not the entity-drift we hunt
+    "located", "accessed", "reached", "called", "contacted", "found", "used", "set",
+    "provided", "available", "listed", "given", "made", "obtained", "handled",
+}
+
+
+def _content_terms(text: str) -> set[str]:
+    """Lower-cased content terms with light singularisation; mirrors the retrieval tokeniser."""
+    terms: set[str] = set()
+    for tok in _WORD.findall(text.lower()):
+        if len(tok) <= 2 or tok in _DRIFT_STOP or tok.isdigit():
+            continue
+        if len(tok) > 4 and tok.endswith("ies"):
+            tok = f"{tok[:-3]}y"
+        elif len(tok) > 4 and tok.endswith("s") and not tok.endswith("ss"):
+            tok = tok[:-1]
+        terms.add(tok)
+    return terms
+
+
+def relation_drift(prose: str, sentences: list[str], window: int = 3) -> list[str]:
+    """Content words the prose binds next to a protected value but that never appear in the
+    evidence — candidate relation-drift (the 'elevator 3639' case). Empty list == clean.
+
+    Only words within `window` tokens of a number are scrutinised, so general rephrasing
+    elsewhere in the sentence is tolerated; only vocabulary hugging a fact must be grounded.
+    """
+    evidence = " ".join(_CITE_SUFFIX.sub("", s) for s in sentences)
+    evidence_vocab = _content_terms(evidence)
+    tokens = _WORD.findall(prose)
+
+    offending: list[str] = []
+    seen: set[str] = set()
+    for index, token in enumerate(tokens):
+        if not _PROTECTED_VALUE.fullmatch(token):
+            continue
+        lo = max(0, index - window)
+        hi = min(len(tokens), index + window + 1)
+        for term in _content_terms(" ".join(tokens[lo:hi])):
+            if term not in evidence_vocab and term not in seen:
+                seen.add(term)
+                offending.append(term)
+    return offending
+
+
+def parrot_trustworthy(prose: str, sentences: list[str]) -> bool:
+    """Full parrot trust contract: no invented numbers AND no relation-drift near a fact."""
+    return numbers_grounded(prose, sentences) and not relation_drift(prose, sentences)

@@ -32,11 +32,59 @@ from typing import Any, Iterable
 from cls_backend.spectrum import classify_query
 from cls_config import DEFAULT_DLLM_API_KEY, DEFAULT_DLLM_API_URL, DEFAULT_DLLM_MODEL
 
-EMBED_DIM = 768
+EMBED_DIM = 384  # all-MiniLM-L6-v2
+MIN_EXTRACTIVE_SCORE = 0.38
+MAX_ANSWER_ROWS = 16
+VECTOR_STORE_RECOVERY_MESSAGE = (
+    "The vector index could not be read. It may be from an older embedding model, "
+    "or a previous run may have left a partial HNSW segment on disk. Reset the "
+    "Chroma index and re-index your documents."
+)
+
+
+class EmbeddingUnavailableError(RuntimeError):
+    """Raised when the configured retrieval encoder cannot produce an embedding."""
+
+
+class VectorStoreUnavailableError(RuntimeError):
+    """Raised when Chroma's persisted vector/index files cannot be read safely."""
+
+
+def _vector_store_error(exc: Exception) -> VectorStoreUnavailableError:
+    return VectorStoreUnavailableError(VECTOR_STORE_RECOVERY_MESSAGE)
+
+
+class SentenceTransformerEmbedder:
+    """Semantic retrieval encoder: sentence-transformers, runs fully offline on CPU.
+
+    Downloads all-MiniLM-L6-v2 (~80 MB) on first use and caches in
+    ~/.cache/huggingface/hub/. After that, load is local and instant.
+    """
+
+    MODEL_NAME = "all-MiniLM-L6-v2"
+
+    def __init__(self, model_name: str = MODEL_NAME) -> None:
+        self.model_name = model_name
+        self._model = None
+
+    def _load(self):
+        if self._model is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+            except ImportError as exc:
+                raise EmbeddingUnavailableError(
+                    "sentence-transformers is not installed. Run: pip install sentence-transformers"
+                ) from exc
+            self._model = SentenceTransformer(self.model_name)
+        return self._model
+
+    def embed(self, texts: Iterable[str]) -> list[list[float]]:
+        vecs = self._load().encode(list(texts), normalize_embeddings=True, show_progress_bar=False)
+        return [v.tolist() for v in vecs]
 
 
 class OllamaEmbedder:
-    """Retrieval Encoder: Ollama-based embedder using nomic-embed-text."""
+    """Alternative: Ollama-based embedder (requires Ollama service running locally)."""
 
     def __init__(self, model: str = "nomic-embed-text", base_url: str = "http://localhost:11434") -> None:
         self.model = model
@@ -57,13 +105,15 @@ class OllamaEmbedder:
             with urllib.request.urlopen(request, timeout=10.0) as response:
                 data = json.loads(response.read().decode("utf-8"))
                 embedding = data.get("embedding")
-                if isinstance(embedding, list) and len(embedding) == EMBED_DIM:
+                if isinstance(embedding, list):
                     return embedding
-        except Exception:
-            pass
-        # Fallback to zero vector to avoid crashing the pipeline; callers should surface
-        # an offline/embedder warning in the UI when all hits have zero similarity.
-        return [0.0] * EMBED_DIM
+        except Exception as exc:
+            raise EmbeddingUnavailableError(
+                f"Ollama retrieval encoder is unavailable at {self.base_url}."
+            ) from exc
+        raise EmbeddingUnavailableError(
+            f"Ollama model {self.model!r} returned an invalid embedding."
+        )
 
 
 def collection_count(collection) -> int:
@@ -96,11 +146,16 @@ _STOP_WORDS = {
 
 
 def lexical_terms(text: str) -> set[str]:
-    return {
-        token
-        for token in re.findall(r"[a-zA-Z0-9][a-zA-Z0-9_\-/\.]*", text.lower())
-        if len(token) > 2 and token not in _STOP_WORDS
-    }
+    terms: set[str] = set()
+    for token in re.findall(r"[a-zA-Z0-9][a-zA-Z0-9_\-/\.]*", text.lower()):
+        if len(token) <= 2 or token in _STOP_WORDS:
+            continue
+        if len(token) > 4 and token.endswith("ies"):
+            token = f"{token[:-3]}y"
+        elif len(token) > 4 and token.endswith("s") and not token.endswith("ss"):
+            token = token[:-1]
+        terms.add(token)
+    return terms
 
 
 _CHUNK_HEADER = re.compile(
@@ -148,20 +203,18 @@ def extract_sentences(text: str) -> list[str]:
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+", normalized) if s.strip()]
 
 
-def build_extractive_answer(query: str, rows: list[dict], max_sentences: int = 5) -> list[str]:
+def _sentence_candidates(query: str, rows: list[dict]) -> list[tuple[int, float, str, dict]]:
     terms = lexical_terms(query)
     candidates: list[tuple[int, float, str, dict]] = []
-    for row in rows[:5]:
+    for row in rows[:MAX_ANSWER_ROWS]:
         for segment, metadata in iter_document_segments(row):
             for sentence in extract_sentences(segment):
                 overlap = len(terms & lexical_terms(sentence))
-                if overlap:
-                    candidates.append((overlap, row["score"], sentence, metadata))
+                candidates.append((overlap, row["score"], sentence, metadata))
+    return candidates
 
-    if not candidates:
-        return []
 
-    candidates.sort(key=lambda item: (item[0], item[1], len(item[2])), reverse=True)
+def _format_extractive_sentences(candidates: list[tuple[float, float, str, dict]], max_sentences: int) -> list[str]:
     chosen: list[str] = []
     seen: set[str] = set()
     for _, _, sentence, metadata in candidates:
@@ -178,8 +231,54 @@ def build_extractive_answer(query: str, rows: list[dict], max_sentences: int = 5
     return chosen
 
 
+def build_extractive_answer(query: str, rows: list[dict], max_sentences: int = 5) -> list[str]:
+    candidates = [
+        candidate for candidate in _sentence_candidates(query, rows)
+        if candidate[0] > 0
+    ]
+
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda item: (item[0], item[1], len(item[2])), reverse=True)
+    return _format_extractive_sentences(candidates, max_sentences)
+
+
+def build_semantic_extractive_answer(
+    query: str,
+    rows: list[dict],
+    embedder,
+    max_sentences: int = 5,
+) -> list[str]:
+    """Rank candidate sentences with the same local encoder used for retrieval."""
+    candidates = [
+        candidate for candidate in _sentence_candidates(query, rows)
+        if len(candidate[2]) >= 30
+    ]
+    if not candidates:
+        return []
+
+    # Keep sentence reranking bounded so the no-LLM answer lane stays responsive.
+    candidates = candidates[:160]
+    try:
+        vectors = embedder.embed([query] + [sentence for _, _, sentence, _ in candidates])
+    except EmbeddingUnavailableError:
+        return build_extractive_answer(query, rows, max_sentences=max_sentences)
+
+    query_vec = vectors[0]
+    ranked: list[tuple[float, float, str, dict]] = []
+    for candidate, sentence_vec in zip(candidates, vectors[1:]):
+        overlap, row_score, sentence, metadata = candidate
+        semantic = sum(a * b for a, b in zip(query_vec, sentence_vec))
+        score = semantic + (0.04 * overlap) + (0.08 * row_score)
+        ranked.append((score, row_score, sentence, metadata))
+
+    ranked.sort(key=lambda item: (item[0], item[1], len(item[2])), reverse=True)
+    return _format_extractive_sentences(ranked, max_sentences)
+
+
 # Deterministic, instant text cleanup — DocuSearch-style "clean parsed text", no LLM.
-_HYPHEN_BREAK = re.compile(r"([A-Za-z]{2,})-\s+([a-z]{2,})")  # "undula- tor" -> "undulator"
+_HYPHEN_BREAK = re.compile(r"([A-Za-z]{2,})-\s+([a-z]{2,})")  # "synchro- tron" -> "synchrotron"
 _CITE_SUFFIX = re.compile(r"\s*(\[Source:[^\]]*\])\s*$")
 _SPACE_BEFORE_PUNCT = re.compile(r"\s+([,.;:])")
 
@@ -206,6 +305,145 @@ def clean_sentences(sentences: list[str]) -> list[str]:
             seen.add(key)
             out.append(cleaned)
     return out
+
+
+# ------------------------------------------------------------------------------- #
+# Cross-reference expansion — post-retrieval, pre-LLM enrichment.
+#
+# Problem: a retrieved chunk may say "see Section 4.2" or "as shown in Figure 3".
+# The embedding for that sentence is about the *topic*, not the content of the
+# reference target — so the referenced content is never in the top-k. The LLM
+# gets a dangling pointer it cannot resolve.
+#
+# Fix: after the top-k rows are assembled, (1) fetch the ±1 adjacent chunks from
+# the same source (catches "see above/below" and gives the LLM wider context),
+# and (2) regex-extract explicit cross-refs and do a secondary lexical lookup
+# restricted to the same document to pull in the referenced content.
+#
+# Expansion rows are tagged {"expanded": True, "score": 0.0} so they are
+# invisible to extractive-bullet scoring (MIN_EXTRACTIVE_SCORE gate) but travel
+# with `rows` into the LLM context window.
+# ------------------------------------------------------------------------------- #
+
+_XREF_RE = re.compile(
+    r"\b(?:"
+    r"(?:Section|Sec\.?|§)\s*\d+(?:\.\d+)*"
+    r"|(?:Figure|Fig\.?)\s*\d+(?:\.\d+)*"
+    r"|(?:Table)\s*\d+(?:\.\d+)*"
+    r"|(?:Appendix|App\.?)\s*[A-Z]"
+    r"|(?:Chapter|Ch\.?)\s*\d+"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def extract_cross_refs(text: str) -> list[str]:
+    """Return unique cross-reference strings found in *text* (Section X.Y, Figure N…)."""
+    seen: set[str] = set()
+    refs: list[str] = []
+    for match in _XREF_RE.finditer(text):
+        ref = re.sub(r"\s+", " ", match.group(0)).strip()
+        if ref not in seen:
+            seen.add(ref)
+            refs.append(ref)
+    return refs
+
+
+def expand_cross_refs(
+    collection,
+    rows: list[dict],
+    embedder,
+    *,
+    max_ref_expansions: int = 6,
+) -> list[dict]:
+    """Enrich retrieved rows with adjacent chunks and resolved cross-references.
+
+    Step 1 — adjacent chunks: for each of the top-8 rows fetch chunk_index ±1
+    from the same source (cheap Chroma ``get`` by ID).
+
+    Step 2 — explicit ref resolution: regex-extract cross-refs (Section X.Y,
+    Figure N…) from each row's text and do a secondary *lexical* lookup inside
+    the same document to pull the referenced content.
+
+    Returns the original rows list with expansion rows appended.  Expansion rows
+    carry ``{"expanded": True, "score": 0.0}`` so they are excluded from
+    extractive-bullet scoring but included in the LLM context passed downstream.
+    """
+    if not rows:
+        return rows
+
+    # Track already-present chunk IDs so we don't duplicate.
+    def _cid(meta: dict) -> str:
+        return f"{meta.get('source_hash', '')}:{meta.get('chunk_index', -999999):05d}"
+
+    existing: set[str] = {_cid(row.get("metadata", {})) for row in rows}
+    expansion: list[dict] = []
+
+    # ------------------------------------------------------------------ #
+    # Step 1: adjacent chunk fetch (±1 neighbor within same source)       #
+    # ------------------------------------------------------------------ #
+    adj_ids: list[str] = []
+    for row in rows[:8]:
+        meta = row.get("metadata", {})
+        source_hash = meta.get("source_hash", "")
+        chunk_index = meta.get("chunk_index")
+        if not source_hash or chunk_index is None:
+            continue
+        for offset in (-1, 1):
+            cid = f"{source_hash}:{chunk_index + offset:05d}"
+            if cid not in existing:
+                adj_ids.append(cid)
+                existing.add(cid)  # reserve so duplicates from two rows don't double-fetch
+
+    if adj_ids:
+        try:
+            fetched = collection.get(ids=adj_ids, include=["documents", "metadatas"])
+            for doc, meta in zip(
+                fetched.get("documents") or [],
+                fetched.get("metadatas") or [],
+            ):
+                if doc:
+                    expansion.append({
+                        "document": doc,
+                        "metadata": meta or {},
+                        "score": 0.0,
+                        "distance": 1.0,
+                        "expanded": True,
+                        "expand_reason": "adjacent",
+                    })
+        except Exception:
+            pass  # non-existent IDs (first/last chunk) silently skipped
+
+    # ------------------------------------------------------------------ #
+    # Step 2: explicit cross-ref resolution (lexical, same-source gate)   #
+    # ------------------------------------------------------------------ #
+    ref_count = 0
+    for row in rows[:6]:
+        if ref_count >= max_ref_expansions:
+            break
+        meta = row.get("metadata", {})
+        source_hash = meta.get("source_hash", "")
+        refs = extract_cross_refs(row.get("document", ""))
+        for ref in refs[:3]:
+            if ref_count >= max_ref_expansions:
+                break
+            mf = {"source_hash": source_hash} if source_hash else None
+            try:
+                ref_rows = lexical_retrieve(collection, ref, n_results=2, metadata_filter=mf)
+            except Exception:
+                continue
+            for rrow in ref_rows:
+                cid = _cid(rrow.get("metadata", {}))
+                if cid not in existing:
+                    existing.add(cid)
+                    rrow = dict(rrow)  # don't mutate the original
+                    rrow["expanded"] = True
+                    rrow["expand_reason"] = f"xref:{ref}"
+                    rrow["score"] = 0.0  # invisible to extractive scoring
+                    expansion.append(rrow)
+                    ref_count += 1
+
+    return rows + expansion
 
 
 def merge_adjacent_segments(rows: list[dict]) -> list[dict]:
@@ -241,6 +479,40 @@ def merge_adjacent_segments(rows: list[dict]) -> list[dict]:
     return merged
 
 
+def _row_key(row: dict) -> str:
+    meta = row.get("metadata", {})
+    return f"{meta.get('source_hash', '')}:{meta.get('chunk_index', '')}"
+
+
+def _merge_hybrid(semantic: list[dict], lexical: list[dict], top_k: int) -> list[dict]:
+    """Blend semantic search with keyword hits so exact user terms can rescue recall."""
+    seen: dict[str, dict] = {}
+    for row in semantic:
+        key = _row_key(row)
+        seen[key] = dict(row)
+        seen[key]["score"] = row["score"]
+        seen[key]["semantic_score"] = row["score"]
+        seen[key]["lexical_score"] = 0.0
+
+    for row in lexical:
+        key = _row_key(row)
+        lexical_score = row["score"]
+        if key in seen:
+            semantic_score = seen[key].get("semantic_score", seen[key]["score"])
+            blended = min(1.0, (0.72 * semantic_score) + (0.28 * lexical_score) + 0.08)
+            seen[key]["score"] = max(seen[key]["score"], blended)
+            seen[key]["lexical_score"] = lexical_score
+        else:
+            supplement = dict(row)
+            supplement["semantic_score"] = 0.0
+            supplement["lexical_score"] = lexical_score
+            supplement["score"] = min(0.92, 0.85 * lexical_score)
+            seen[key] = supplement
+
+    ranked = sorted(seen.values(), key=lambda r: (r["score"], r.get("lexical_score", 0.0)), reverse=True)
+    return ranked[:top_k]
+
+
 def retrieve(
     collection,
     embedder,
@@ -258,7 +530,13 @@ def retrieve(
     }
     if metadata_filter:
         query_params["where"] = metadata_filter
-    result = collection.query(**query_params)
+    try:
+        result = collection.query(**query_params)
+    except Exception as exc:
+        # A half-written / version-mismatched HNSW segment ("Nothing found on disk") or any
+        # other store-level read failure must not crash the app. Surface an actionable error
+        # the UI already renders cleanly; the fix is always Reset Chroma index + re-index.
+        raise _vector_store_error(exc) from exc
     rows: list[dict] = []
     documents = result.get("documents", [[]])[0]
     metadatas = result.get("metadatas", [[]])[0]
@@ -267,6 +545,50 @@ def retrieve(
         score = max(0.0, min(1.0, 1.0 - float(distance)))
         rows.append({"document": document, "metadata": metadata or {}, "distance": distance, "score": score})
     return rows
+
+
+def lexical_retrieve(
+    collection,
+    query: str,
+    n_results: int = 8,
+    metadata_filter: dict | None = None,
+) -> list[dict]:
+    """Deterministic fallback when the semantic retrieval encoder is unavailable."""
+    if collection_count(collection) == 0:
+        return []
+    query_terms = lexical_terms(query)
+    if not query_terms:
+        return []
+
+    get_params: dict[str, Any] = {"include": ["documents", "metadatas"]}
+    if metadata_filter:
+        get_params["where"] = metadata_filter
+    try:
+        result = collection.get(**get_params)
+    except Exception as exc:
+        raise _vector_store_error(exc) from exc
+
+    ranked: list[tuple[int, float, dict]] = []
+    documents = result.get("documents", []) or []
+    metadatas = result.get("metadatas", []) or []
+    for document, metadata in zip(documents, metadatas):
+        document_terms = lexical_terms(document or "")
+        overlap = query_terms & document_terms
+        if not overlap:
+            continue
+        coverage = len(overlap) / len(query_terms)
+        specificity = len(overlap) / max(1, len(document_terms) ** 0.5)
+        score = max(0.0, min(1.0, coverage + min(0.2, specificity / 4)))
+        row = {
+            "document": document,
+            "metadata": metadata or {},
+            "distance": 1.0 - score,
+            "score": score,
+        }
+        ranked.append((len(overlap), score, row))
+
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [row for _, _, row in ranked[:n_results]]
 
 
 def _dllm_headers() -> dict[str, str]:
@@ -330,7 +652,7 @@ def instant_answer(
     collection,
     cache,
     embedder,
-    top_k: int = 8,
+    top_k: int = 16,
     cache_enabled: bool = True,
     metadata_filter: dict | None = None,
     debate_enabled: bool = False,
@@ -343,20 +665,63 @@ def instant_answer(
     category = classify_query(query)
     sig = corpus_signature(collection)
 
-    hit = cache.lookup(query, sig) if cache_enabled else None
+    retrieval_mode = "hybrid"
+    try:
+        hit = cache.lookup(query, sig) if cache_enabled else None
+    except EmbeddingUnavailableError:
+        hit = None
+        retrieval_mode = "lexical_fallback"
     if hit:
         rows, from_cache, similarity = hit["rows"], True, hit["similarity"]
     else:
-        rows = retrieve(collection, embedder, query, n_results=top_k, metadata_filter=metadata_filter)
+        if retrieval_mode == "lexical_fallback":
+            rows = lexical_retrieve(collection, query, n_results=top_k, metadata_filter=metadata_filter)
+        else:
+            try:
+                semantic_rows = retrieve(
+                    collection, embedder, query,
+                    n_results=top_k, metadata_filter=metadata_filter,
+                )
+                # Always run lexical in parallel as a keyword safety net; merge results.
+                lexical_rows = lexical_retrieve(
+                    collection, query,
+                    n_results=max(4, top_k // 2), metadata_filter=metadata_filter,
+                )
+                rows = _merge_hybrid(semantic_rows, lexical_rows, top_k)
+            except EmbeddingUnavailableError:
+                retrieval_mode = "lexical_fallback"
+                rows = lexical_retrieve(collection, query, n_results=top_k, metadata_filter=metadata_filter)
         from_cache, similarity = False, None
         if debate_enabled and rows:
             rows = self_debate_refine(query, rows)
-        if cache_enabled and rows:
-            cache.store(query, rows, sig, category=category, top_k=top_k)
+        if cache_enabled and rows and retrieval_mode == "hybrid":
+            try:
+                cache.store(query, rows, sig, category=category, top_k=top_k)
+            except EmbeddingUnavailableError:
+                pass
+
+    # Reference expansion: pull adjacent chunks and resolve explicit cross-refs
+    # (Section X.Y, Figure N…) so the LLM context window contains the referenced
+    # content. Expansion rows are invisible to extractive-bullet scoring.
+    if rows and retrieval_mode != "lexical_fallback":
+        try:
+            rows = expand_cross_refs(collection, rows, embedder)
+        except Exception:
+            pass  # expansion is best-effort; never block the main answer
 
     merged = merge_adjacent_segments(rows)
+    if retrieval_mode == "hybrid":
+        answer_rows = [
+            row for row in rows
+            if row.get("semantic_score", row.get("score", 0.0)) >= MIN_EXTRACTIVE_SCORE
+        ]
+    else:
+        answer_rows = [row for row in rows if row.get("score", 0.0) >= MIN_EXTRACTIVE_SCORE]
     # Instant, deterministic clean parse — no LLM augmentation.
-    answer = clean_sentences(build_extractive_answer(query, merged or rows)) if rows else []
+    if answer_rows and retrieval_mode == "hybrid":
+        answer = clean_sentences(build_semantic_extractive_answer(query, answer_rows, embedder))
+    else:
+        answer = clean_sentences(build_extractive_answer(query, answer_rows)) if answer_rows else []
     return {
         "rows": rows,
         "merged": merged,
@@ -364,4 +729,5 @@ def instant_answer(
         "category": category,
         "from_cache": from_cache,
         "similarity": similarity,
+        "retrieval_mode": retrieval_mode,
     }

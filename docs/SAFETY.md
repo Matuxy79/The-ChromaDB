@@ -1,10 +1,10 @@
-# CLS Safety Flags
+# Safety Flags
 
-This prototype is not a safety authority. It is a local evidence assistant that can help locate relevant text in indexed CLS documents.
+This prototype is not a safety authority. It is a local evidence assistant that helps locate relevant text in indexed synchrotron facility documents.
 
 ## What The Safety Layer Does
 
-`examples/cls_safety.py` checks each user query for conservative keyword triggers such as:
+`cls_backend/safety.py` checks each user query for conservative keyword triggers:
 
 - beryllium
 - radiation and interlocks
@@ -14,39 +14,38 @@ This prototype is not a safety authority. It is a local evidence assistant that 
 - vacuum failure
 - fire, medical, evacuation, injury
 
-When a trigger matches, the UI keeps the answer grounded in retrieved evidence and should point the user to beamline staff or emergency contacts when evidence is incomplete. Optional carrier cleanup is still limited to mechanical text cleanup; it is not allowed to improvise procedures.
+When a trigger matches, the UI keeps the answer grounded in retrieved evidence and directs the user to facility staff or emergency contacts when evidence is incomplete. Optional carrier cleanup is still limited to mechanical text cleanup; it cannot improvise procedures.
 
-The interface should still be read conservatively:
+The answer should always be read conservatively:
 
 - answer only from retrieved evidence
 - do not infer or improvise procedures from partial snippets
-- contact beamline staff if the evidence is incomplete
+- contact facility staff if the evidence is incomplete
 - follow emergency contacts first for active emergencies
 
 ## What It Does Not Do
 
 - It does not certify that an answer is safe.
-- It does not replace beamline staff, training, permits, lockouts, posted procedures, or control-room instructions.
+- It does not replace facility staff, training, permits, lockouts, posted procedures, or control-room instructions.
 - It does not prove a document is current.
 
 ## Emergency Contacts
 
-The current prototype includes contacts extracted from the IVU beamline manual. Treat these as configuration data that must be reviewed before production use.
+Contacts are defined in `cls_backend/safety.py::EMERGENCY_CONTACTS`. Update that list — not the UI — when numbers change.
 
 | Contact | Number | Note |
-| ------- | ------ | ---- |
+| --- | --- | --- |
 | Fire / Ambulance | 911 | Serious emergency |
 | U-Sask Security | 9-306-966-5555 | From a CLS phone |
 | CLS Control Room | ext. 3570 | Operations / beam |
 | Floor Coordinator | ext. 3639 | Hutch access / floor |
 | Health & Safety (HSE) | ext. 3663 | Reportable incidents |
-| Beamline (SOE-3 / IVU) | ext. 3832 | In-hutch phone |
 
 ## Low-Confidence Flag
 
-The retrieval layer marks an answer low-confidence when the best Chroma distance is above `0.55`. This threshold lives in `examples/cls_safety.py` as `LOW_CONFIDENCE_DISTANCE`.
+The retrieval layer marks an answer low-confidence when the best Chroma cosine distance is above `0.55`. This threshold lives in `cls_backend/safety.py` as `LOW_CONFIDENCE_DISTANCE`.
 
-The user should then open the retrieval trace and inspect the source preview before relying on the answer.
+When flagged, open the retrieval trace and inspect the source preview before relying on the answer.
 
 ## Recommended Production Safeties
 
@@ -54,4 +53,4 @@ The user should then open the retrieval trace and inspect the source preview bef
 - Add document version/date metadata and display it in the retrieval trace.
 - Add a mandatory "call staff" response for active emergency language.
 - Add tests for every safety keyword category.
-- Never show safety-critical guidance without retrieved evidence and visible source trace.
+- Never show safety-critical guidance without retrieved evidence and a visible source trace.

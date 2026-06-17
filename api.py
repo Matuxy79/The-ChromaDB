@@ -15,9 +15,9 @@ CLS_RAG_MODEL = "cls-rag-cag-v1.0"
 
 
 app = FastAPI(
-    title="CLS IVU RAG+CAG API",
+    title="CLS dsRAG+CAG API",
     version=APP_VERSION,
-    description="Shared RAG API plus inference carrier proxy for Streamlit and OpenAI-compatible frontends.",
+    description="Shared RAG API plus inference carrier proxy for Streamlit, Chainlit, and OpenAI-compatible frontends.",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -30,7 +30,7 @@ app.add_middleware(
 
 class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1)
-    top_k: int = Field(8, ge=1, le=20)
+    top_k: int = Field(16, ge=1, le=24)
     cache_enabled: bool = True
     min_similarity: float = Field(0.97, ge=0.0, le=1.0)
     metadata_filter: dict | None = None
@@ -46,7 +46,7 @@ class ChatCompletionRequest(BaseModel):
     model: str = CLS_RAG_MODEL
     messages: list[ChatMessage]
     stream: bool = False
-    top_k: int = Field(8, ge=1, le=20)
+    top_k: int = Field(16, ge=1, le=24)
     cache_enabled: bool = True
     min_similarity: float = Field(0.97, ge=0.0, le=1.0)
     metadata_filter: dict | None = None
@@ -75,6 +75,7 @@ def _query_payload(request: QueryRequest) -> dict[str, Any]:
         "category": result["category"],
         "from_cache": result["from_cache"],
         "similarity": result["similarity"],
+        "retrieval_mode": result.get("retrieval_mode", "semantic"),
         "rows": result["rows"],
     }
 

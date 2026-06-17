@@ -1,43 +1,76 @@
-# CLS dsRAG Architecture Review (v1.1)
+# CLS Synchrotron Research Query — Architecture (v1.2)
 
 ## Product Shape
 
-The app is a domain-specific RAG (dsRAG) implementation using:
+The app is a domain-specific RAG+CAG (dsRAG) implementation:
 
-- **Indexing:** semantic sectioning and AutoContext (via dsRAG patterns), embedded with `nomic-embed-text` (Ollama), and stored in ChromaDB.
-- **Research scopes:** metadata-gated retrieval domains for outreach, science, logistics, operations, and administration context.
-- **Relevance audit:** a second-pass filter that keeps high-signal retrieved chunks before generation.
-- **Scientist chat:** embed the question, optionally filter by research scope, retrieve matching chunks, optionally refine via the relevance audit, and render cited deterministic extraction instantly.
-- **Shared API:** expose the same retrieval path to Streamlit and OpenAI-compatible frontends.
-- **Inference carrier:** when keyed, OpenRouter + `openai/gpt-oss-120b` synthesizes a direct answer from the refined evidence rows.
+- **Indexing:** semantic sectioning with AutoContext patterns, embedded with `all-MiniLM-L6-v2` (sentence-transformers, offline CPU), stored in ChromaDB.
+- **Research scopes:** metadata-gated retrieval across six disciplines (Chemistry, Computer Science, Biology, Physics, Mathematics, Literature).
+- **Query repair:** natural-language scaffolding is stripped before embedding so verbose human phrasing maps to the same vector as the keyword form.
+- **Hybrid retrieval:** semantic vector search always runs alongside a lexical keyword scan; results merge so exact-keyword hits are never lost.
+- **Relevance audit:** second-pass filter that drops low-signal chunks before generation.
+- **Query path:** repair the query → embed → optional scope filter → hybrid retrieve → CAG cache check → deterministic cited extraction → optional carrier synthesis.
+- **Shared API:** same retrieval path exposed to Streamlit and OpenAI-compatible frontends.
+- **Inference carrier:** when keyed, OpenRouter + `openai/gpt-oss-120b` synthesizes a direct answer from refined evidence rows (Full App only).
 
-A secondary **carrier cleanup** checkbox can mechanically clean extraction artifacts after the instant answer is already available. It is off by default.
+## Two UIs
+
+| Surface | Entry | Visible controls |
+| --- | --- | --- |
+| Full App | Landing → "Full App" card | All roles, corpus admin, upload, precision controls, eval, evidence rows, optional carrier synthesis |
+| Ask Lane | Landing → "Ask Lane" card | Bright llama.cui-style chat: scope selector, chat input, cited answer with source chips — no LLM, no engineering telemetry |
+
+Both surfaces share the same retrieval backend. Session state keys are isolated (`lane_*` vs `last_*`) so switching between them is safe. The Ask Lane keeps a conversation history (`lane_messages`) and renders each turn as native chat bubbles with a source-chip row.
+
+## Research Scopes
+
+```python
+RESEARCH_SCOPES = {
+    "All disciplines":  None,
+    "Chemistry":        {"domain": "chemistry"},
+    "Computer Science": {"domain": "computer_science"},
+    "Biology":          {"domain": "biology"},
+    "Physics":          {"domain": "physics"},
+    "Mathematics":      {"domain": "mathematics"},
+    "Literature":       {"domain": "literature"},
+}
+```
+
+`None` bypasses the Chroma metadata filter. Any other value is passed as `metadata_filter={"domain": "<value>"}` to the retrieval call. Documents are tagged at upload time with the matching domain string.
 
 ## Model Roles
 
 | Component | Model | Required? | Why |
-| --------- | ----- | --------- | --- |
-| Indexing embeddings | `nomic-embed-text` (Ollama) | Yes | High-quality 768d vectors for scientific retrieval. |
-| Query embeddings | `nomic-embed-text` (Ollama) | Yes | Same encoder as indexing. |
-| Relevance audit | `CLS_DLLM_MODEL` | Optional | Evidence relevance auditing of retrieved chunks. |
-| Inference carrier | `CLS_DLLM_MODEL` (`openai/gpt-oss-120b` by default) | Optional | Synthesizes a direct answer from refined evidence rows when the carrier is keyed and toggled on. |
-| Carrier cleanup | `CLS_DLLM_MODEL` | Optional | Corrects extraction artifacts through the same carrier only when the cleanup checkbox is on. |
+| --- | --- | --- | --- |
+| Query / index embeddings | `all-MiniLM-L6-v2` (sentence-transformers) | Yes | Real semantic vectors, offline on CPU, ~80 MB one-time download |
+| Relevance audit | `CLS_DLLM_MODEL` | Optional | Drop irrelevant chunks before synthesis |
+| Inference carrier | `openai/gpt-oss-120b` (default) | Optional | Synthesizes grounded answer from evidence rows (Full App) |
+| Carrier cleanup | `CLS_DLLM_MODEL` | Optional | Corrects PDF extraction artifacts; off by default |
 
-The launchers do not start Ollama and do not pull local models. Make sure Ollama is running and `nomic-embed-text` is available before indexing or querying.
+The embedder downloads once to `~/.cache/huggingface/hub/`; after that it loads locally with no network. The launchers do not start Ollama and do not pull any LLM.
+
+### Pluggable carrier
+
+The carrier is any OpenAI-compatible `/v1/chat/completions` endpoint. Swap backends with env vars — no code change:
+
+- **OpenRouter** (cloud, keyed): default `https://openrouter.ai/api/v1`.
+- **llama.cpp** (local, offline): run `llama-server -m model.gguf --port 8080`, set `CLS_DLLM_API_URL=http://localhost:8080/v1`, unset the key.
+- **Ollama** (local): point `CLS_DLLM_API_URL` at `http://localhost:11434/v1`.
 
 ## Runtime Layers
 
 ```text
 Streamlit UI (Research Scopes)
+  -> query repair (strip NL scaffolding)
   -> FastAPI bridge when CLS_USE_API=1, otherwise embedded cls_service
-  -> Retrieval Encoder (nomic-embed-text via Ollama)
-  -> Metadata Filter (Research Scope)
-  -> CAG Layer cache
-  -> Evidence Store search on cache miss
-  -> Relevance Audit (optional refinement)
+  -> SentenceTransformerEmbedder (all-MiniLM-L6-v2, local CPU)
+  -> Metadata Filter (domain scope)
+  -> CAG Layer (SemanticEvidenceCache)
+  -> Hybrid retrieve on cache miss: semantic vector + lexical keyword, merged (ChromaDB)
+  -> Relevance Audit (optional)
   -> deterministic answer builder
-  -> optional inference carrier synthesis
-  -> optional carrier cleanup for extraction artifacts
+  -> optional inference carrier synthesis (Full App)
+  -> optional carrier cleanup (extraction artifacts only)
 ```
 
 `/v1/chat/completions` exposes two model routes:
@@ -45,44 +78,70 @@ Streamlit UI (Research Scopes)
 - `cls-rag-cag-v1.0`: local RAG/CAG extraction.
 - `CLS_DLLM_MODEL`: proxy to the configured external inference carrier.
 
-`/v1/dllm/chat` is the direct carrier proxy used by the Streamlit synthesis, relevance audit, and cleanup controls.
+`/v1/dllm/chat` is the direct carrier proxy used by Streamlit synthesis, relevance audit, and cleanup.
+
+## Hybrid Retrieval
+
+`instant_answer` always runs both retrievers and merges them in `_merge_hybrid`:
+
+- **Semantic** (`retrieve`): MiniLM vector search — handles paraphrase and messy natural language.
+- **Lexical** (`lexical_retrieve`): term-overlap keyword scan — catches an exact keyword the encoder ranked low.
+- **Merge:** semantic scores win on chunks both retrievers return; lexical-only hits are appended as a safety net, then truncated to `top_k`.
+
+If the embedder is unavailable, retrieval degrades cleanly to lexical-only (`retrieval_mode = "lexical_fallback"`).
+
+## Query Repair
+
+`cls_backend/query_repair.py::repair_query` strips conversational scaffolding before embedding — "can you tell me about the X-ray energy range" → "X-ray energy range". It runs on every query in `query_backend`. `TYPO_REPLACEMENTS` and `QUERY_EXPANSIONS` are empty hooks for deployment-specific acronym repair.
 
 ## CAG Layer
 
-The app is **RAG + CAG**, not just RAG. The CAG Layer (`cls_backend/cag_cache.py`, `SemanticEvidenceCache`) is a second ChromaDB collection keyed by the embedding of a past question.
+The CAG Layer (`cls_backend/cag_cache.py`, `SemanticEvidenceCache`) is a second ChromaDB collection keyed by the embedding of a past question.
 
-- **Lookup:** each question is encoded by the same Retrieval Encoder and matched against the cache with a cosine threshold.
-- **Reuse granularity:** evidence only. A hit reuses stored evidence while the deterministic answer builder re-runs.
-- **Invalidation:** every entry stores a `corpus_sig` derived from the Evidence Store's source hashes. Re-indexing or resetting the store makes stale cache entries unreachable.
-- **Encoder caveat:** with `nomic-embed-text`, the cache generalises better across paraphrases than the previous deterministic encoder, but near-identical questions still give the strongest hits.
+- **Lookup:** question is encoded by MiniLM and matched against the cache with a cosine threshold. With a real semantic encoder, the cache now generalises across paraphrases, not just near-identical strings.
+- **Reuse granularity:** evidence rows only. A hit reuses stored evidence while the deterministic answer builder re-runs.
+- **Invalidation:** every entry stores a `corpus_sig` derived from Evidence Store source hashes. Re-indexing makes stale cache entries unreachable.
 
 ## Evidence Store
 
-The active v1.1 Streamlit path stores chunks in `chroma_store` using the collection names in `cls_config.py`:
+Collection names are in `cls_config.py`:
 
-- `cls_v1_dsrag_evidence`: indexed evidence chunks (768d).
-- `cls_v1_dsrag_cag_cache`: cached query-to-evidence rows (768d).
+- `cls_v2_dsrag_evidence` — indexed evidence chunks (384d, MiniLM).
+- `cls_v2_dsrag_cag_cache` — cached query-to-evidence rows (384d, MiniLM).
 
-Because the embedding model changed from v1.0, the v1.0 collections (`cls_ivu_manual_hash_v1`, `cls_cag_evidence_cache_v1`) are no longer queried. Use **Reset Chroma index** in the sidebar and re-index to start a clean v1.1 dsRAG store.
+> **Migration note (v1.1 → v1.2):** the encoder changed from a 768d hash to 384d MiniLM, so the collections were renamed `v1` → `v2`. The old `cls_v1_*` collections are no longer queried. Use **Reset Chroma index** in the admin sidebar and re-index to build the v2 store.
+
+### Document readers
+
+`cls_backend/readers.py` normalises extraction across formats so the rest of the pipeline stays document-type-agnostic. Supported formats:
+
+- PDF (`pymupdf`)
+- Plain text / Markdown
+- DOCX (`python-docx`, small pure-Python dependency)
+- HTML / HTM (stdlib parser, strips script/style/nav/footer/header)
+- CSV / TSV (stdlib, each row becomes a pseudo-page with header context)
+- JSON (stdlib, flattened and paginated)
+
+All readers return `(page_number, text)` tuples; chunking, embedding, and indexing are unchanged.
 
 ## Performance Notes
 
 For a 7 MB / 100-page PDF on CPU:
 
-- PDF extraction: a few seconds.
-- Chunking: under a second.
-- Embedding with `nomic-embed-text` via Ollama: depends on local GPU/CPU, typically seconds to tens of seconds.
-- Chroma storage: usually under a few seconds.
+| Step | Typical time |
+| --- | --- |
+| PDF extraction | a few seconds |
+| Chunking | under a second |
+| MiniLM embedding (first call) | a few seconds (model load) |
+| MiniLM embedding (warm) | well under a second |
+| Chroma storage | under a few seconds |
 
-The inference carrier has no effect on indexing speed. It runs only for relevance auditing, synthesis, or cleanup after retrieval has already produced evidence rows.
+The inference carrier runs only after retrieval; it has no effect on indexing speed.
 
-## Current Design Choice
+## Design Philosophy
 
-The prototype favors a small, inspectable local retrieval path:
-
-- User question -> deterministic query repair -> `nomic-embed-text` embedding -> optional research-scope metadata filter -> Chroma vector search.
-- Optional relevance audit uses the inference carrier to drop irrelevant chunks.
-- CAG cache reuses prior evidence for repeated questions.
-- With a keyed carrier, the default UI shows carrier synthesis above deterministic cited extraction.
-- Retrieval evidence rows remain visible so both answer modes can be audited.
+- Retrieval is instant and primary (DocuSearch-inspired).
+- The Ask Lane is built for speed first: instant cited extraction, with an optional tiny local parrot (Qwen 2.5 0.5B via Ollama/llama.cpp) that rephrases evidence and is guarded by a deterministic relation-drift check.
+- The deterministic cited extraction is always shown; carrier synthesis is a downstream Full-App option.
+- The prototype favors inspectable local retrieval: every evidence row is visible and auditable.
 - Carrier cleanup is downstream, optional, guarded, and API-only.

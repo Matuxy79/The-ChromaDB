@@ -7,7 +7,7 @@ returned and the slow evidence-store search is skipped (the formatter still re-r
 the prose stays fresh — we cache retrieval, not generation).
 
 Architecture (names used across the app):
-    Retrieval Encoder (HashEmbedder) -> Evidence Store (ChromaDB) -> deterministic answer builder
+    Retrieval Encoder (sentence-transformers) -> Evidence Store (ChromaDB) -> deterministic answer builder
     CAG Layer = this semantic cache of prior (query -> retrieved evidence) results.
 
 Design notes:
@@ -16,8 +16,8 @@ Design notes:
   works; the app passes its HashEmbedder.
 - Entries are scoped by `corpus_sig` so a re-indexed Evidence Store never serves stale
   evidence. The cache holds JSON-serialised evidence rows in the document field.
-- With the lexical HashEmbedder, matches are reliable for near-identical queries;
-  paraphrase generalisation would need a semantic encoder.
+- With a semantic encoder, near-identical and paraphrased queries can reuse prior
+  evidence while the corpus signature prevents stale retrieval rows.
 """
 
 from __future__ import annotations
@@ -51,12 +51,16 @@ class SemanticEvidenceCache:
         """Return the cached evidence for a close-enough prior query, else None."""
         if not query.strip() or self.count() == 0:
             return None
-        result = self.collection.query(
-            query_embeddings=[self._embed(query)],
-            n_results=1,
-            where={"corpus_sig": corpus_sig},
-            include=["documents", "metadatas", "distances"],
-        )
+        embedding = self._embed(query)
+        try:
+            result = self.collection.query(
+                query_embeddings=[embedding],
+                n_results=1,
+                where={"corpus_sig": corpus_sig},
+                include=["documents", "metadatas", "distances"],
+            )
+        except Exception:
+            return None
         documents = result.get("documents", [[]])[0]
         distances = result.get("distances", [[]])[0]
         metadatas = result.get("metadatas", [[]])[0]
@@ -84,26 +88,36 @@ class SemanticEvidenceCache:
         """Upsert the retrieved evidence under this query (deterministic id dedups)."""
         if not query.strip() or not rows:
             return
-        self.collection.upsert(
-            ids=[self._entry_id(query, corpus_sig)],
-            embeddings=[self._embed(query)],
-            documents=[json.dumps(rows)],
-            metadatas=[
-                {
-                    "query": query.strip(),
-                    "category": category,
-                    "corpus_sig": corpus_sig,
-                    "top_k": int(top_k),
-                    "created_at": time.time(),
-                }
-            ],
-        )
+        embedding = self._embed(query)
+        try:
+            self.collection.upsert(
+                ids=[self._entry_id(query, corpus_sig)],
+                embeddings=[embedding],
+                documents=[json.dumps(rows)],
+                metadatas=[
+                    {
+                        "query": query.strip(),
+                        "category": category,
+                        "corpus_sig": corpus_sig,
+                        "top_k": int(top_k),
+                        "created_at": time.time(),
+                    }
+                ],
+            )
+        except Exception:
+            return
 
     def clear(self) -> None:
-        existing = self.collection.get()
+        try:
+            existing = self.collection.get()
+        except Exception:
+            return
         ids = existing.get("ids") or []
         if ids:
-            self.collection.delete(ids=ids)
+            try:
+                self.collection.delete(ids=ids)
+            except Exception:
+                return
 
     def count(self) -> int:
         try:

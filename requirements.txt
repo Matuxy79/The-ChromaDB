@@ -1,6 +1,9 @@
 streamlit
+chainlit
 fastapi
 uvicorn[standard]
 chromadb
 pandas
 pymupdf
+python-docx
+sentence-transformers

@@ -7,6 +7,7 @@ import chromadb
 from cls_backend.cag_cache import SemanticEvidenceCache
 from cls_backend.pipeline import (
     EMBED_DIM,
+    EmbeddingUnavailableError,
     OllamaEmbedder,
     build_extractive_answer,
     clean_sentence,
@@ -33,6 +34,11 @@ class TestEmbedder:
         return [v / norm for v in vector]
 
 
+class OfflineEmbedder:
+    def embed(self, texts):
+        raise EmbeddingUnavailableError("offline")
+
+
 def fresh_collection():
     client = chromadb.EphemeralClient()
     return client.create_collection(f"store_{uuid.uuid4().hex}", metadata={"hnsw:space": "cosine"})
@@ -50,9 +56,9 @@ def doc(name, section, page, body):
 
 class CleanTextTests(unittest.TestCase):
     def test_rejoins_hyphenation_and_keeps_citation(self):
-        out = clean_sentence("The undula- tor is aligned. [Source: m.pdf, page 4]")
-        self.assertIn("undulator", out)
-        self.assertNotIn("undula- tor", out)
+        out = clean_sentence("The synchro- tron is aligned. [Source: m.pdf, page 4]")
+        self.assertIn("synchrotron", out)
+        self.assertNotIn("synchro- tron", out)
         self.assertIn("[Source: m.pdf, page 4]", out)
 
     def test_collapses_space_before_punctuation(self):
@@ -68,12 +74,12 @@ class RetrieveAndInstantAnswerTests(unittest.TestCase):
         self.embedder = TestEmbedder()
         self.collection = fresh_collection()
         docs = [
-            doc("IVU.pdf", "Contacts", 4, "The Undulator beamline phone is ext. 3832 for operators."),
-            doc("IVU.pdf", "Optics", 7, "The undulator energy range spans several kiloelectronvolts."),
+            doc("manual.pdf", "Contacts", 4, "The CLS Control Room phone is ext. 3570 for operators."),
+            doc("manual.pdf", "Specifications", 7, "The synchrotron X-ray energy range spans several kiloelectronvolts."),
         ]
         metas = [
-            {"source": "IVU.pdf", "source_hash": "h1", "page": 4, "section": "Contacts", "chunk_index": 0},
-            {"source": "IVU.pdf", "source_hash": "h1", "page": 7, "section": "Optics", "chunk_index": 1},
+            {"source": "manual.pdf", "source_hash": "h1", "page": 4, "section": "Contacts", "chunk_index": 0},
+            {"source": "manual.pdf", "source_hash": "h1", "page": 7, "section": "Specifications", "chunk_index": 1},
         ]
         self.collection.add(
             ids=["h1:0", "h1:1"],
@@ -83,16 +89,31 @@ class RetrieveAndInstantAnswerTests(unittest.TestCase):
         )
 
     def test_retrieve_returns_scored_rows(self):
-        rows = retrieve(self.collection, self.embedder, "undulator phone number", n_results=2)
+        rows = retrieve(self.collection, self.embedder, "control room phone number", n_results=2)
         self.assertTrue(rows)
         self.assertIn("score", rows[0])
 
     def test_retrieve_empty_collection(self):
         self.assertEqual(retrieve(fresh_collection(), self.embedder, "anything"), [])
 
+    def test_instant_answer_uses_lexical_fallback_when_embedder_is_offline(self):
+        result = instant_answer(
+            "control room phone number",
+            collection=self.collection,
+            cache=make_cache(),
+            embedder=OfflineEmbedder(),
+            top_k=2,
+            cache_enabled=False,
+        )
+
+        self.assertEqual(result["retrieval_mode"], "lexical_fallback")
+        self.assertTrue(result["rows"])
+        self.assertIn("3570", result["rows"][0]["document"])
+        self.assertTrue(result["answer"])
+
     def test_instant_answer_fresh_then_cached(self):
         cache = make_cache()
-        q = "What is the undulator beamline phone number?"
+        q = "What is the CLS control room phone number?"
         first = instant_answer(q, collection=self.collection, cache=cache, embedder=self.embedder, top_k=4)
         self.assertTrue(first["rows"])
         self.assertFalse(first["from_cache"])
@@ -112,12 +133,12 @@ class RetrieveAndInstantAnswerTests(unittest.TestCase):
         rows = [
             {
                 "document": (
-                    doc("IVU.pdf", "Contacts", 4, "The Undulator beamline phone is ext. 3832.")
+                    doc("manual.pdf", "Contacts", 4, "The CLS Control Room phone is ext. 3570.")
                     + "\n\n--- adjacent segment ---\n\n"
-                    + doc("IVU.pdf", "Optics", 7, "The undulator energy range spans several kiloelectronvolts.")
+                    + doc("manual.pdf", "Specifications", 7, "The synchrotron X-ray energy range spans several kiloelectronvolts.")
                 ),
                 "metadata": {
-                    "source": "IVU.pdf",
+                    "source": "manual.pdf",
                     "source_hash": "h1",
                     "page": 4,
                     "section": "Contacts",
@@ -127,11 +148,11 @@ class RetrieveAndInstantAnswerTests(unittest.TestCase):
             }
         ]
 
-        answer = build_extractive_answer("energy range", rows)
+        answer = build_extractive_answer("X-ray energy range", rows)
 
         self.assertTrue(answer)
-        self.assertIn("[Source: IVU.pdf, page 7]", answer[0])
-        self.assertNotIn("[Source: IVU.pdf, page 4]", answer[0])
+        self.assertIn("[Source: manual.pdf, page 7]", answer[0])
+        self.assertNotIn("[Source: manual.pdf, page 4]", answer[0])
 
 
 if __name__ == "__main__":

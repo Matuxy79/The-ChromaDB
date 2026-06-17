@@ -37,48 +37,48 @@ def make_cache(distance_max=0.03):
 
 
 ROWS = [
-    {"document": "Undulator phone is 3832.", "metadata": {"source": "m.pdf", "page": 4}, "distance": 0.8, "score": 0.2},
+    {"document": "Control room extension is 3570.", "metadata": {"source": "m.pdf", "page": 4}, "distance": 0.8, "score": 0.2},
 ]
 
 
 class CagCacheTests(unittest.TestCase):
     def test_store_then_lookup_identical_is_hit(self):
         cache = make_cache()
-        cache.store("IVU phone number?", ROWS, corpus_sig="sigA", category="contacts", top_k=8)
-        hit = cache.lookup("IVU phone number?", corpus_sig="sigA")
+        cache.store("control room phone?", ROWS, corpus_sig="sigA", category="contacts", top_k=8)
+        hit = cache.lookup("control room phone?", corpus_sig="sigA")
         self.assertIsNotNone(hit)
         self.assertEqual(hit["rows"], ROWS)
         self.assertGreaterEqual(hit["similarity"], 0.99)
-        self.assertEqual(hit["cached_query"], "IVU phone number?")
+        self.assertEqual(hit["cached_query"], "control room phone?")
 
     def test_normalized_variant_is_hit(self):
         cache = make_cache()
-        cache.store("IVU  phone number?", ROWS, corpus_sig="sigA")
-        self.assertIsNotNone(cache.lookup("ivu phone number?", corpus_sig="sigA"))
+        cache.store("control room  phone?", ROWS, corpus_sig="sigA")
+        self.assertIsNotNone(cache.lookup("control room phone?", corpus_sig="sigA"))
 
     def test_unrelated_query_is_miss(self):
         cache = make_cache()
-        cache.store("IVU phone number?", ROWS, corpus_sig="sigA")
+        cache.store("control room phone?", ROWS, corpus_sig="sigA")
         # Different text hashes to a different bucket -> orthogonal -> distance ~1.0.
         self.assertIsNone(cache.lookup("cryostat warm up steps", corpus_sig="sigA"))
 
     def test_corpus_sig_mismatch_is_miss(self):
         cache = make_cache()
-        cache.store("IVU phone number?", ROWS, corpus_sig="sigA")
-        self.assertIsNone(cache.lookup("IVU phone number?", corpus_sig="sigB"))
+        cache.store("control room phone?", ROWS, corpus_sig="sigA")
+        self.assertIsNone(cache.lookup("control room phone?", corpus_sig="sigB"))
 
     def test_upsert_dedups_repeated_query(self):
         cache = make_cache()
-        cache.store("IVU phone number?", ROWS, corpus_sig="sigA")
-        cache.store("IVU phone number?", ROWS, corpus_sig="sigA")
+        cache.store("control room phone?", ROWS, corpus_sig="sigA")
+        cache.store("control room phone?", ROWS, corpus_sig="sigA")
         self.assertEqual(cache.count(), 1)
 
     def test_clear_empties_cache(self):
         cache = make_cache()
-        cache.store("IVU phone number?", ROWS, corpus_sig="sigA")
+        cache.store("control room phone?", ROWS, corpus_sig="sigA")
         cache.clear()
         self.assertEqual(cache.count(), 0)
-        self.assertIsNone(cache.lookup("IVU phone number?", corpus_sig="sigA"))
+        self.assertIsNone(cache.lookup("control room phone?", corpus_sig="sigA"))
 
     def test_empty_cache_lookup_is_none(self):
         self.assertIsNone(make_cache().lookup("anything", corpus_sig="sigA"))

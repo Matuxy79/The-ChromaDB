@@ -1,5 +1,0 @@
-recall and outlook replacement and source info updating
-
-changing the ui to remove the high level
-
-meta data formatting and text formatting

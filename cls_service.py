@@ -6,14 +6,14 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, Generator
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
 import chromadb
-import fitz
 
+from cls_backend.readers import load_document
 from cls_config import (
     CACHE_COLLECTION_NAME,
     CHROMA_DIR,
@@ -23,10 +23,30 @@ from cls_config import (
     DEFAULT_DLLM_API_KEY,
     DEFAULT_DLLM_API_URL,
     DEFAULT_DLLM_MODEL,
+    DEFAULT_PARROT_MODEL,
+    DEFAULT_PARROT_URL,
 )
 from cls_backend.cag_cache import SemanticEvidenceCache
-from cls_backend.dllm import ANSWER_SYSTEM, ASSIST_SYSTEM, answer_user, assist_user
-from cls_backend.pipeline import EMBED_DIM, OllamaEmbedder, collection_count, instant_answer, retrieve
+from cls_backend.dllm import (
+    ANSWER_SYSTEM,
+    ASSIST_SYSTEM,
+    PARROT_SYSTEM,
+    answer_user,
+    assist_user,
+    parrot_grounded,
+    parrot_user,
+)
+from cls_backend.pipeline import (
+    EMBED_DIM,
+    VECTOR_STORE_RECOVERY_MESSAGE,
+    OllamaEmbedder,
+    SentenceTransformerEmbedder,
+    collection_count,
+    expand_cross_refs,
+    extract_cross_refs,
+    instant_answer,
+    retrieve,
+)
 
 
 @dataclass(frozen=True)
@@ -37,18 +57,18 @@ class Chunk:
 
 
 _RESOURCE_LOCK = RLock()
-_embedder: OllamaEmbedder | None = None
+_embedder: SentenceTransformerEmbedder | None = None
 _chroma_client: Any | None = None
 _collection: chromadb.Collection | None = None
 _cache_collection: chromadb.Collection | None = None
 _cache: SemanticEvidenceCache | None = None
 
 
-def get_embedder() -> OllamaEmbedder:
+def get_embedder() -> SentenceTransformerEmbedder:
     global _embedder
     with _RESOURCE_LOCK:
         if _embedder is None:
-            _embedder = OllamaEmbedder()
+            _embedder = SentenceTransformerEmbedder()
         return _embedder
 
 
@@ -67,8 +87,8 @@ def get_collection() -> chromadb.Collection:
             _collection = get_chroma_client().get_or_create_collection(
                 name=COLLECTION_NAME,
                 metadata={
-                    "description": "CLS IVU beamline manual extractive retrieval prototype",
-                    "embedding": f"local_hash_{EMBED_DIM}d",
+                    "description": "CLS synchrotron research document retrieval",
+                    "embedding": f"all-MiniLM-L6-v2_{EMBED_DIM}d",
                     "hnsw:space": "cosine",
                 },
             )
@@ -83,7 +103,7 @@ def get_cache_collection() -> chromadb.Collection:
                 name=CACHE_COLLECTION_NAME,
                 metadata={
                     "description": "CLS CAG semantic evidence cache",
-                    "embedding": f"local_hash_{EMBED_DIM}d",
+                    "embedding": f"all-MiniLM-L6-v2_{EMBED_DIM}d",
                     "hnsw:space": "cosine",
                 },
             )
@@ -110,28 +130,7 @@ def uploaded_signature(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:16]
 
 
-def load_pdf(path: Path) -> list[tuple[int, str]]:
-    pages: list[tuple[int, str]] = []
-    with fitz.open(path) as document:
-        for page_index, page in enumerate(document, start=1):
-            text = page.get_text("text").strip()
-            if text:
-                pages.append((page_index, text))
-    return pages
 
-
-def load_text(path: Path) -> list[tuple[int, str]]:
-    text = path.read_text(encoding="utf-8", errors="replace").strip()
-    return [(1, text)] if text else []
-
-
-def load_document(path: Path) -> list[tuple[int, str]]:
-    suffix = path.suffix.lower()
-    if suffix == ".pdf":
-        return load_pdf(path)
-    if suffix in {".txt", ".md"}:
-        return load_text(path)
-    raise ValueError(f"Unsupported file type: {suffix}. Use PDF, TXT, or MD.")
 
 
 def detect_section(text: str, fallback: str) -> str:
@@ -207,7 +206,12 @@ def split_page_text(
     return chunks
 
 
-def build_chunks(path: Path, source_hash: str, extra_metadata: dict | None = None) -> list[Chunk]:
+def build_chunks(
+    path: Path,
+    source_hash: str,
+    extra_metadata: dict | None = None,
+    source_name: str | None = None,
+) -> list[Chunk]:
     pages = load_document(path)
     chunks: list[Chunk] = []
     next_index = 0
@@ -215,7 +219,7 @@ def build_chunks(path: Path, source_hash: str, extra_metadata: dict | None = Non
         page_chunks = split_page_text(
             text=text,
             page_number=page_number,
-            source_name=path.name,
+            source_name=source_name or path.name,
             source_hash=source_hash,
             starting_index=next_index,
             extra_metadata=extra_metadata,
@@ -226,46 +230,78 @@ def build_chunks(path: Path, source_hash: str, extra_metadata: dict | None = Non
 
 
 def source_is_indexed(collection: chromadb.Collection, source_hash: str) -> bool:
-    result = collection.get(where={"source_hash": source_hash}, limit=1)
+    try:
+        result = collection.get(where={"source_hash": source_hash}, limit=1)
+    except Exception as exc:
+        raise RuntimeError(VECTOR_STORE_RECOVERY_MESSAGE) from exc
     return bool(result.get("ids"))
 
 
-def ingest_path(path: Path, source_hash: str, force: bool = False, extra_metadata: dict | None = None) -> tuple[int, str]:
+def ingest_path(
+    path: Path,
+    source_hash: str,
+    force: bool = False,
+    extra_metadata: dict | None = None,
+    source_name: str | None = None,
+    embedder: Any | None = None,
+) -> tuple[int, str]:
     collection = get_collection()
+    existing_ids: list[str] = []
     if source_is_indexed(collection, source_hash):
         if not force:
             return 0, "already indexed"
-        existing = collection.get(where={"source_hash": source_hash})
-        if existing.get("ids"):
-            collection.delete(ids=existing["ids"])
+        try:
+            existing = collection.get(where={"source_hash": source_hash})
+        except Exception as exc:
+            raise RuntimeError(VECTOR_STORE_RECOVERY_MESSAGE) from exc
+        existing_ids = existing.get("ids") or []
 
-    chunks = build_chunks(path, source_hash, extra_metadata=extra_metadata)
+    chunks = build_chunks(
+        path,
+        source_hash,
+        extra_metadata=extra_metadata,
+        source_name=source_name,
+    )
     if not chunks:
         return 0, "no readable text found"
 
-    embeddings = get_embedder().embed(chunk.text for chunk in chunks)
-    collection.add(
-        ids=[chunk.chunk_id for chunk in chunks],
-        documents=[chunk.text for chunk in chunks],
-        metadatas=[chunk.metadata for chunk in chunks],
-        embeddings=embeddings,
-    )
+    embeddings = (embedder or get_embedder()).embed(chunk.text for chunk in chunks)
+    chunk_ids = [chunk.chunk_id for chunk in chunks]
+    write = collection.upsert if existing_ids else collection.add
+    try:
+        write(
+            ids=chunk_ids,
+            documents=[chunk.text for chunk in chunks],
+            metadatas=[chunk.metadata for chunk in chunks],
+            embeddings=embeddings,
+        )
+    except Exception as exc:
+        raise RuntimeError(VECTOR_STORE_RECOVERY_MESSAGE) from exc
+    stale_ids = list(set(existing_ids) - set(chunk_ids))
+    if stale_ids:
+        try:
+            collection.delete(ids=stale_ids)
+        except Exception as exc:
+            raise RuntimeError(VECTOR_STORE_RECOVERY_MESSAGE) from exc
     return len(chunks), "indexed"
 
 
 def reset_collection() -> None:
-    global _collection
+    """Factory-reset the vector store: drop *every* collection, not just the current one, so
+    stale/old-version collections (e.g. earlier 768d/512d builds) can't pile up or shadow the
+    active store. The next get_collection() recreates a clean, empty v2 collection to re-index.
+    """
+    global _collection, _cache_collection, _cache
     with _RESOURCE_LOCK:
         client = get_chroma_client()
-        try:
-            client.delete_collection(COLLECTION_NAME)
-        except Exception:
-            pass
+        for collection in client.list_collections():
+            try:
+                client.delete_collection(collection.name)
+            except Exception:
+                pass
         _collection = None
-    try:
-        get_cache().clear()
-    except Exception:
-        pass
+        _cache_collection = None
+        _cache = None
 
 
 def evidence_breakdown(collection: chromadb.Collection | None = None) -> list[dict]:
@@ -298,20 +334,20 @@ def evidence_breakdown(collection: chromadb.Collection | None = None) -> list[di
 
 EVAL_CASES = [
     {
-        "question": "Who are the IVU beamline contacts and phone numbers?",
-        "keywords": ["beatriz", "narayan", "al", "3868", "3648", "3530"],
+        "question": "What are the main CLS control room and floor coordinator contacts?",
+        "keywords": ["control room", "floor coordinator", "3570", "3639"],
     },
     {
-        "question": "What are the emergency contact numbers for fire or ambulance?",
-        "keywords": ["911", "security", "306-966-5555"],
+        "question": "What emergency numbers are listed for fire or medical help?",
+        "keywords": ["911", "security", "emergency"],
     },
     {
-        "question": "What beamline phone number is listed for the Undulator beamline?",
-        "keywords": ["undulator", "soe-3", "3832"],
+        "question": "How do I request hutch access or beamline support?",
+        "keywords": ["hutch", "access", "support", "procedure"],
     },
     {
-        "question": "Where does the manual describe the in-vacuum undulator?",
-        "keywords": ["in-vacuum", "undulator"],
+        "question": "Where does the documentation describe sample mounting procedures?",
+        "keywords": ["sample", "mount", "procedure"],
     },
 ]
 
@@ -339,7 +375,7 @@ def evaluate_retrieval() -> list[dict]:
 def ask_manual(
     query: str,
     *,
-    top_k: int = 8,
+    top_k: int = 16,
     cache_enabled: bool = True,
     min_similarity: float = 0.97,
     metadata_filter: dict | None = None,
@@ -510,6 +546,151 @@ def generate_answer(
         model=model,
         timeout=timeout,
     ).strip()
+
+
+def stream_generate_answer(
+    query: str,
+    rows: list[dict],
+    *,
+    model: str = DEFAULT_DLLM_MODEL,
+    timeout: float = 90.0,
+    grounded: bool = True,
+) -> Generator[str, None, None]:
+    """Stream a grounded answer token-by-token via SSE (OpenAI chat/completions with stream=True).
+
+    Yields individual text tokens as they arrive so the caller can pass this directly to
+    ``st.write_stream()`` for live rendering without waiting for the full response.
+    """
+    if grounded and not rows:
+        return
+    if not DEFAULT_DLLM_API_URL:
+        raise RuntimeError("Inference carrier is not configured. Set CLS_DLLM_API_URL.")
+
+    system = ANSWER_SYSTEM if grounded else ASSIST_SYSTEM
+    user = answer_user(query, rows) if grounded else assist_user(query, rows)
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    payload = json.dumps({"model": model, "messages": messages, "stream": True}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{DEFAULT_DLLM_API_URL}/chat/completions",
+        data=payload,
+        headers=_dllm_headers(),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8").strip()
+                if not line.startswith("data:"):
+                    continue
+                chunk = line[5:].strip()
+                if chunk == "[DONE]":
+                    break
+                try:
+                    data = json.loads(chunk)
+                    token = (
+                        data.get("choices", [{}])[0]
+                        .get("delta", {})
+                        .get("content")
+                    )
+                    if token:
+                        yield token
+                except (json.JSONDecodeError, IndexError, KeyError):
+                    continue
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"Streaming call failed: {exc}") from exc
+
+
+def parrot_status(timeout: float = 1.0) -> dict:
+    """Is the small local parrot model reachable? (Ollama OpenAI-compatible endpoint.)"""
+    online = False
+    try:
+        request = urllib.request.Request(f"{DEFAULT_PARROT_URL}/models", method="GET")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            online = 200 <= response.status < 300
+    except Exception:
+        online = False
+    return {"online": online, "model": DEFAULT_PARROT_MODEL, "base_url": DEFAULT_PARROT_URL}
+
+
+def parrot_answer(sentences: list[str], *, timeout: float = 30.0) -> str | None:
+    """Rephrase grounded extractive sentences into one natural-language paragraph using the
+    small local model. Returns None if the model is unavailable or if the output drifts from
+    the evidence (invents a number) — the caller then falls back to the extractive bullets.
+    """
+    if not sentences:
+        return None
+    payload = json.dumps(
+        {
+            "model": DEFAULT_PARROT_MODEL,
+            "messages": [
+                {"role": "system", "content": PARROT_SYSTEM},
+                {"role": "user", "content": parrot_user(sentences)},
+            ],
+            "stream": False,
+            "temperature": 0.0,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{DEFAULT_PARROT_URL}/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        prose = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+    except Exception:
+        return None
+    if not prose or not parrot_grounded(prose, sentences):
+        return None
+    return prose
+
+
+def parrot_stream(sentences: list[str], *, timeout: float = 60.0):
+    """Yield natural-language tokens that rephrase the grounded sentences, streamed from the
+    small local model. The grounded extractive answer stays the source of truth; this stream
+    is the fallible 'human' layer on top. Yields nothing if the model is unavailable.
+    """
+    if not sentences:
+        return
+    payload = json.dumps(
+        {
+            "model": DEFAULT_PARROT_MODEL,
+            "messages": [
+                {"role": "system", "content": PARROT_SYSTEM},
+                {"role": "user", "content": parrot_user(sentences)},
+            ],
+            "stream": True,
+            "temperature": 0.0,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{DEFAULT_PARROT_URL}/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            for raw in response:
+                line = raw.decode("utf-8").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                delta = (chunk.get("choices") or [{}])[0].get("delta", {})
+                token = delta.get("content")
+                if token:
+                    yield token
+    except Exception:
+        return
 
 
 def service_status() -> dict:

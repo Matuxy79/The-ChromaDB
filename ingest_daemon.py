@@ -5,10 +5,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from cls_backend.readers import SUPPORTED_SUFFIXES
 from cls_service import file_signature, ingest_path
-
-
-SUPPORTED_SUFFIXES = {".pdf", ".txt"}
 
 
 def load_sidecar_metadata(path: Path) -> dict[str, Any]:
@@ -109,7 +107,7 @@ def process_document(path: Path, args: argparse.Namespace) -> bool:
 def run_once(args: argparse.Namespace) -> int:
     documents = iter_documents(args.inbox)
     if not documents:
-        print(f"[idle] No PDF/TXT files found in {args.inbox}")
+        print(f"[idle] No supported files found in {args.inbox}")
         return 0
 
     count = 0

@@ -4,43 +4,59 @@ from cls_backend.query_repair import repair_query
 
 
 class QueryRepairTests(unittest.TestCase):
-    def test_ivw_is_not_rewritten_to_ivu(self):
-        repaired = repair_query("tell me about the ivw beamline")
+    def test_returns_required_keys(self):
+        result = repair_query("sample mounting procedure")
+        self.assertIn("original", result)
+        self.assertIn("search", result)
+        self.assertIn("changed", result)
+        self.assertIn("notes", result)
 
-        self.assertIn("IVW wiggler beamline", repaired["search"])
-        self.assertNotIn("Normalized spaced IVW acronym.", repaired["notes"])
-        self.assertNotIn("Corrected IVW to IVU.", repaired["notes"])
-        self.assertNotIn("IVU beamline BXDS", repaired["search"])
+    def test_passthrough_clean_query(self):
+        q = "sample mounting alignment procedure"
+        result = repair_query(q)
+        self.assertEqual(result["search"], q)
+        self.assertFalse(result["changed"])
 
-    def test_ivu_is_not_treated_as_spaced_acronym(self):
-        repaired = repair_query("tell me about the ivu beamline")
+    def test_strips_how_do_i(self):
+        result = repair_query("how do I mount my sample")
+        self.assertNotIn("how do i", result["search"].lower())
+        self.assertIn("mount", result["search"].lower())
 
-        self.assertIn("IVU beamline BXDS", repaired["search"])
-        self.assertNotIn("Normalized spaced IVU acronym.", repaired["notes"])
+    def test_strips_can_you_tell_me(self):
+        result = repair_query("can you tell me about the X-ray energy range")
+        self.assertIn("X-ray energy range", result["search"])
+        self.assertNotIn("can you tell me", result["search"].lower())
 
-    def test_spaced_ivw_is_normalized_to_ivw(self):
-        repaired = repair_query("tell me about i v w")
+    def test_strips_i_was_wondering(self):
+        result = repair_query("I was wondering about sample preparation protocol")
+        self.assertIn("sample preparation protocol", result["search"])
 
-        self.assertIn("IVW", repaired["search"])
-        self.assertIn("Normalized spaced IVW acronym.", repaired["notes"])
+    def test_strips_what_is_the(self):
+        result = repair_query("what is the sample mounting procedure")
+        self.assertNotIn("what is", result["search"].lower())
+        self.assertIn("sample mounting", result["search"].lower())
 
-    def test_spaced_ivu_is_normalized_to_ivu(self):
-        repaired = repair_query("tell me about i v u")
+    def test_strips_trailing_question_mark(self):
+        result = repair_query("what are the radiation safety interlocks?")
+        self.assertNotIn("?", result["search"])
 
-        self.assertIn("IVU", repaired["search"])
-        self.assertIn("Normalized spaced IVU acronym.", repaired["notes"])
+    def test_empty_query_returns_empty(self):
+        result = repair_query("")
+        self.assertEqual(result["search"], "")
 
-    def test_bxd_is_corrected_to_bxds(self):
-        repaired = repair_query("bxd optics")
+    def test_pure_filler_falls_back_to_original(self):
+        # Normalization should not produce an empty string — fall back to original.
+        result = repair_query("how do i")
+        self.assertGreater(len(result["search"].strip()), 0)
 
-        self.assertIn("BXDS", repaired["search"])
-        self.assertIn("Corrected BXD to BXDS.", repaired["notes"])
+    def test_original_always_preserved(self):
+        q = "What is the SAXS beamline energy range?"
+        result = repair_query(q)
+        self.assertEqual(result["original"], q)
 
-    def test_wiggler_expands_toward_ivw_not_ivu(self):
-        repaired = repair_query("wiggler beamline")
-
-        self.assertIn("IVW low energy wiggler", repaired["search"])
-        self.assertNotIn("IVU beamline BXDS", repaired["search"])
+    def test_strips_leading_whitespace(self):
+        result = repair_query("  X-ray diffraction resolution  ")
+        self.assertEqual(result["search"], "X-ray diffraction resolution")
 
 
 if __name__ == "__main__":
