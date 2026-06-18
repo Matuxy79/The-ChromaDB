@@ -2,7 +2,7 @@
 set -u
 
 APP_NAME="CLS RAG+CAG Prototype"
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="$ROOT_DIR/.venv"
 PYTHON_CMD="${PYTHON_CMD:-python3}"
 PORT="${STREAMLIT_PORT:-8501}"

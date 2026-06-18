@@ -1,14 +1,16 @@
 """Chainlit Ask Lane — a streaming, layered RAG/CAG chat over the shared backend.
 
-Run:  chainlit run chat_lane.py -w        (or ./launch_chat.sh)
+Run:  chainlit run chat_lane.py -w        (or ./scripts/launch_chat.sh)
 
-Layered answer design (the "instant grounded base, fallible layer on top" idea):
-  BASE — instant grounded extractive evidence, the source of truth, shown in a collapsible
-         step with a match badge (exact / close / loose, or cached).
-  TOP  — natural-language prose streamed token-by-token from the small local parrot model
-         (qwen2.5:0.5b via Ollama). Fluent but fallible — the "human incorrectness" layer.
-         Falls back to the grounded bullets if the parrot is offline, and is flagged if it
-         drifts from the evidence.
+Two-pass answer design:
+  PASS 1 — instant grounded answer from the RAG/CAG engine, no LLM wait.
+            Formatted markdown bullets with match badge (exact / close / loose / cached)
+            and source chips attached.  This is always the source of truth and is visible
+            immediately before the parrot starts.
+  PASS 2 — natural-language prose streamed token-by-token from the small local parrot
+            (qwen2.5:0.5b via Ollama).  The Pass 2 message is created on the first token
+            so there is no empty-message flash.  Falls back silently to Pass 1 alone when
+            the parrot is offline, and is flagged if prose drifts from the evidence.
 
 The retrieval / CAG / parrot / embedder engine is reused unchanged from cls_service and
 cls_backend — this file is only the Chainlit view.
@@ -106,46 +108,52 @@ async def on_message(message: cl.Message):
     mfilter = RESEARCH_SCOPES.get(scope)
     search = repair_query(query)["search"]
 
-    # ---- BASE: instant grounded retrieval (source of truth) ----
+    # ── PASS 1: RAG/CAG engine — instant grounded answer, no LLM wait ────
     result = await cl.make_async(ask_manual)(search, top_k=16, metadata_filter=mfilter)
-    rows = result.get("rows") or []
+    rows   = result.get("rows") or []
     answer = result.get("answer") or []
 
     if not rows:
         await cl.Message(content="_Nothing relevant found — try rephrasing._").send()
         return
 
-    badge = _match_badge(result)
-    async with cl.Step(name=f"grounded evidence · {badge}") as step:
-        step.output = _grounded_bullets(answer)
+    badge   = _match_badge(result)
+    sources = _sources(rows)
+    p1 = cl.Message(content=f"**{badge}**\n\n{_grounded_bullets(answer)}")
+    if sources:
+        p1.elements = [
+            cl.Text(
+                name="Sources",
+                content="\n".join(f"📄 {s}" for s in sources),
+                display="inline",
+            )
+        ]
+    await p1.send()  # user sees grounded answer immediately
 
-    # ---- TOP: streamed parrot prose (fluent, fallible) ----
-    msg = cl.Message(content="")
-    await msg.send()
+    # ── PASS 2: Parrot — message created on first token, no empty flash ───
+    p2: cl.Message | None = None
     streamed = ""
     async for token in _astream_parrot(answer):
+        if p2 is None:
+            p2 = cl.Message(content="")
+            await p2.send()
         streamed += token
-        await msg.stream_token(token)
+        await p2.stream_token(token)
 
-    if not streamed.strip():
-        # Parrot offline — the grounded bullets stand in as the answer.
-        msg.content = _grounded_bullets(answer)
-    else:
-        # Wernicke check: numbers grounded AND no relation-drift near a fact.
-        drift = relation_drift(streamed, answer)
-        if not numbers_grounded(streamed, answer):
-            await msg.stream_token(
-                "\n\n> ⚠ _this phrasing introduced a number not in the source — trust the grounded evidence above._"
-            )
-        elif drift:
-            suspect = ", ".join(f"**{w}**" for w in drift[:4])
-            await msg.stream_token(
-                f"\n\n> ⚠ _phrasing may not match the source near: {suspect} — trust the grounded evidence above._"
-            )
+    if p2 is None or not streamed.strip():
+        return  # parrot offline — pass 1 stands alone
 
-    sources = _sources(rows)
-    if sources:
-        msg.elements = [
-            cl.Text(name="Sources", content="\n".join(f"📄 {s}" for s in sources), display="inline")
-        ]
-    await msg.update()
+    # Wernicke check: numbers grounded AND no relation-drift near a fact.
+    if not numbers_grounded(streamed, answer):
+        await p2.stream_token(
+            "\n\n> ⚠ _this phrasing introduced a number not in the source — "
+            "trust the grounded evidence above._"
+        )
+    elif drift := relation_drift(streamed, answer):
+        suspect = ", ".join(f"**{w}**" for w in drift[:4])
+        await p2.stream_token(
+            f"\n\n> ⚠ _phrasing may not match the source near: {suspect} — "
+            "trust the grounded evidence above._"
+        )
+
+    await p2.update()

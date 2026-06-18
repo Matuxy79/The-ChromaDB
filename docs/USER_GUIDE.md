@@ -7,7 +7,7 @@ A walkthrough for the v1.2 prototype. Retrieval is local and semantic (sentence-
 ## 1. Start The App
 
 ```bash
-./launch_cls.sh
+./scripts/launch_cls.sh
 ```
 
 Creates `.venv` on first run, installs packages, and opens the UI at `http://localhost:8501`. Does not start Ollama or pull any LLM. On first run the embedder (`all-MiniLM-L6-v2`, ~80 MB) downloads once to `~/.cache/huggingface/`; after that it runs fully offline.
@@ -49,7 +49,7 @@ Use **🧹 Clear chat** to reset the conversation, or **← Home** to return to 
 
 In the Full App sidebar:
 
-1. Admins can click **Index default documents** to index the local literature test corpus (`Training for perfect in ui graded/test_books` by default).
+1. Admins can click **Index default documents** to index the local literature test corpus (`data/training_corpus/test_books` by default).
 2. Admins and Scientists can drag-and-drop PDF, TXT, MD, DOCX, HTML, CSV, TSV, and JSON files.
 3. Assign a **Research domain** from the selector before clicking **Index uploaded files**.
 
@@ -98,7 +98,7 @@ The inference carrier only affects synthesis and optional cleanup — it does no
 | --- | --- |
 | Inference carrier offline | Set `CLS_DLLM_API_KEY` in environment, or disable synthesis |
 | No indexed chunks found | Index documents from the sidebar or run `ingest_daemon.py` |
-| API bridge unavailable | Run `./launch_api.sh`, relaunch with `CLS_USE_API=1` |
+| API bridge unavailable | Run `./scripts/launch_api.sh`, relaunch with `CLS_USE_API=1` |
 | Answer is wrong or thin | Open **Retrieval evidence** and check whether the right text was indexed |
 | Streamlit traceback | Re-run the launcher; it refreshes requirements when they drift |
 

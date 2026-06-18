@@ -1,5 +1,80 @@
 # CLS Synchrotron Research Query — Architecture (v1.2)
 
+## Visual Architecture Map
+
+> How the generic web-app layers map to **this** project, corrected for what actually exists.
+
+```mermaid
+flowchart TD
+
+    %% ── CLIENT ─────────────────────────────────────────────────────────
+    subgraph CLIENT["CLIENT  ·  Browser"]
+        UI1["Streamlit Full App\napp.py\n— all roles, admin, eval, carrier synthesis"]
+        UI2["Chainlit Ask Lane\nchat_lane.py\n— fast cited chat, no LLM, no telemetry"]
+    end
+
+    %% ── ROLES NOTE ──────────────────────────────────────────────────────
+    ROLES["⚠ ROLES  ·  UI presentation tiers only\nExplorer · Analyst · Engineer\ncontrols visible widgets — NOT a backend security boundary\n\nThis is where  Auth / Security  would live\nif real login / token enforcement were added"]
+
+    %% ── API GATEWAY (optional) ──────────────────────────────────────────
+    subgraph APIGW["API GATEWAY  ·  optional\napi.py  ·  FastAPI\nonly active when  CLS_USE_API=1"]
+        R1["POST /v1/query"]
+        R2["POST /v1/chat/completions"]
+        R3["POST /v1/dllm/chat"]
+    end
+
+    %% ── SERVICES ────────────────────────────────────────────────────────
+    subgraph SVC["SERVICES\ncls_service.py"]
+        S1["ingest  ·  query  ·  cache\nLLM proxy  ·  status  ·  answer format"]
+    end
+
+    %% ── RAG/CAG PIPELINE ────────────────────────────────────────────────
+    subgraph PIPE["RAG / CAG PIPELINE\ncls_backend/pipeline.py"]
+        P1["query_repair.py\nstrip NL scaffolding\n'can you tell me about X' → 'X'"]
+        P2["MiniLM embed\nall-MiniLM-L6-v2  ·  local CPU\n384-dim vector"]
+        P3["scope filter\ndomain metadata gate"]
+        P4{"CAG cache\nhit?"}
+        P5["hybrid retrieve\nsemantic vector + lexical keyword\nmerged in _merge_hybrid"]
+        P6["relevance audit\ndrop low-signal chunks"]
+        P7["cited answer builder\ndeterministic extraction\nevidence rows + source chips"]
+        P1 --> P2 --> P3 --> P4
+        P4 -->|"cache miss"| P5 --> P6 --> P7
+        P4 -->|"cache hit\nreuse stored evidence"| P7
+    end
+
+    %% ── DATABASE / CACHE ────────────────────────────────────────────────
+    subgraph STORE["DATABASE / CACHE\nchroma_store/  ·  ChromaDB"]
+        DB1["cls_v2_dsrag_evidence\n384-dim evidence vectors\nindexed chunks from all documents"]
+        DB2["cls_v2_dsrag_cag_cache\nCAG semantic cache\ncosine-matched past questions"]
+    end
+
+    %% ── OPTIONAL LLM CARRIER ────────────────────────────────────────────
+    subgraph CARRIER["OPTIONAL LLM CARRIER\ncls_backend/dllm.py"]
+        L1["OpenRouter  ·  Ollama  ·  llama.cpp\nany OpenAI-compatible endpoint\ndefault: openai/gpt-oss-120b\nFull App only  ·  swap via env vars"]
+    end
+
+    %% ── EDGES ───────────────────────────────────────────────────────────
+    UI1 & UI2 --> ROLES
+
+    ROLES -->|"embedded mode\ndefault — direct Python call"| SVC
+    ROLES -.->|"CLS_USE_API=1\nHTTP bridge"| APIGW
+
+    APIGW --> SVC
+    SVC --> PIPE
+    PIPE <-->|"vector search\nCAG lookup + store"| STORE
+    P7 -.->|"optional synthesis\nFull App only"| CARRIER
+    CARRIER -.->|"grounded answer\nback into evidence rows"| P7
+```
+
+**Reading the diagram:**
+
+- Solid arrows `→` are the default embedded code path (no HTTP hop).
+- Dashed arrows `-.->` are optional / conditional paths.
+- The **Roles** box shows where `Auth / Security` *would* live; right now it only gates UI widgets, not backend data.
+- The **API Gateway** box is skipped entirely in the default run; it activates only with `CLS_USE_API=1`.
+
+---
+
 ## Product Shape
 
 The app is a domain-specific RAG+CAG (dsRAG) implementation:

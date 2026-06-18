@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 APP_ROOT = Path(__file__).resolve().parent
-MANUAL_DIR = APP_ROOT / "Training for perfect in ui graded"
+MANUAL_DIR = APP_ROOT / "data" / "training_corpus"
 DEFAULT_DOCUMENTS_DIR = Path(
     os.getenv("CLS_DEFAULT_DOCUMENTS_DIR", str(MANUAL_DIR / "test_books"))
 )

@@ -41,7 +41,7 @@ Both UIs share the same underlying retrieval backend.
 ## Quick Launch
 
 ```bash
-./launch_cls.sh
+./scripts/launch_cls.sh
 ```
 
 Creates `.venv` if needed, installs packages, and opens the UI at `http://localhost:8501`. Does not start Ollama or pull any LLM. On first run the embedder (`all-MiniLM-L6-v2`, ~80 MB) downloads once to `~/.cache/huggingface/`; after that it runs fully offline.
@@ -69,8 +69,8 @@ Without a carrier the app is fully offline: semantic retrieval + instant cited e
 ## API + Dual Frontend
 
 ```bash
-./launch_api.sh
-CLS_USE_API=1 CLS_API_URL=http://127.0.0.1:8010 ./launch_cls.sh
+./scripts/launch_api.sh
+CLS_USE_API=1 CLS_API_URL=http://127.0.0.1:8010 ./scripts/launch_cls.sh
 ```
 
 Key endpoints:
@@ -93,7 +93,7 @@ curl http://127.0.0.1:8010/v1/query \
 
 ## Indexing Documents
 
-- **Admin sidebar**: one-click index of the local literature test corpus (`Training for perfect in ui graded/test_books` by default; override with `CLS_DEFAULT_DOCUMENTS_DIR`).
+- **Admin sidebar**: one-click index of the local literature test corpus (`data/training_corpus/test_books` by default; override with `CLS_DEFAULT_DOCUMENTS_DIR`).
 - **Admin / Scientist sidebar**: drag-and-drop batch upload of PDF, TXT, MD, DOCX, HTML, CSV, TSV, and JSON with domain tagging.
 - **`ingest_daemon.py`**: optional batch indexer for folder-watch experiments.
 
