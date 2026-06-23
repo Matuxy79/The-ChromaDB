@@ -96,7 +96,16 @@ load_env
 pick_python
 ensure_venv
 ensure_requirements
-say "No local model checks are run. Carrier synthesis/cleanup use CLS_DLLM_API_URL when configured."
+if [ "${CLS_RETRIEVAL_ONLY:-1}" = "0" ] || [ "${CLS_RETRIEVAL_ONLY:-1}" = "false" ]; then
+    say "Carrier synthesis/cleanup use CLS_DLLM_API_URL when configured."
+else
+    say "Retrieval-only mode active. LLM synthesis/cleanup are disabled."
+fi
+if [ "${CLS_KEYWORD_ONLY:-1}" = "0" ] || [ "${CLS_KEYWORD_ONLY:-1}" = "false" ]; then
+    say "Hybrid semantic+keyword retrieval active."
+else
+    say "Keyword-only retrieval active for fastest deterministic searches."
+fi
 
 pick_port
 

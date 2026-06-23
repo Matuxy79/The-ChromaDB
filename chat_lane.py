@@ -24,7 +24,7 @@ import threading
 import chainlit as cl
 from chainlit.input_widget import Select
 
-from cls_config import APP_VERSION, RESEARCH_SCOPES
+from cls_config import APP_VERSION, KEYWORD_ONLY_RETRIEVAL, RESEARCH_SCOPES, RETRIEVAL_ONLY
 from cls_backend.query_repair import repair_query
 from cls_backend.dllm import numbers_grounded, relation_drift
 from cls_service import ask_manual, parrot_stream
@@ -88,7 +88,11 @@ async def start():
         content=(
             f"### 🔬 CLS Research Documents `{APP_VERSION}`\n"
             "Ask a question — instant cited answers from your indexed documents. "
-            "The grounded evidence is the source of truth; the phrased answer rides on top."
+            + (
+                "Temporary retrieval-only mode is active; no phrased model answer will run."
+                if RETRIEVAL_ONLY
+                else "The grounded evidence is the source of truth; the phrased answer rides on top."
+            )
         )
     ).send()
 
@@ -104,12 +108,17 @@ async def on_message(message: cl.Message):
     if not query:
         return
 
-    scope = cl.user_session.get("scope") or "All disciplines"
+    scope = cl.user_session.get("scope") or "All beamlines"
     mfilter = RESEARCH_SCOPES.get(scope)
     search = repair_query(query)["search"]
 
     # ── PASS 1: RAG/CAG engine — instant grounded answer, no LLM wait ────
-    result = await cl.make_async(ask_manual)(search, top_k=16, metadata_filter=mfilter)
+    result = await cl.make_async(ask_manual)(
+        search,
+        top_k=16,
+        metadata_filter=mfilter,
+        keyword_only=KEYWORD_ONLY_RETRIEVAL,
+    )
     rows   = result.get("rows") or []
     answer = result.get("answer") or []
 
@@ -129,6 +138,9 @@ async def on_message(message: cl.Message):
             )
         ]
     await p1.send()  # user sees grounded answer immediately
+
+    if RETRIEVAL_ONLY:
+        return
 
     # ── PASS 2: Parrot — message created on first token, no empty flash ───
     p2: cl.Message | None = None

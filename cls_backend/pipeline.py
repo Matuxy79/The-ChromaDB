@@ -27,10 +27,16 @@ import re
 import urllib.error
 import urllib.request
 from collections import Counter
+from threading import RLock
 from typing import Any, Iterable
 
 from cls_backend.spectrum import classify_query
-from cls_config import DEFAULT_DLLM_API_KEY, DEFAULT_DLLM_API_URL, DEFAULT_DLLM_MODEL
+from cls_config import (
+    DEFAULT_DLLM_API_KEY,
+    DEFAULT_DLLM_API_URL,
+    DEFAULT_DLLM_MODEL,
+    RETRIEVAL_ONLY,
+)
 
 EMBED_DIM = 384  # all-MiniLM-L6-v2
 MIN_EXTRACTIVE_SCORE = 0.38
@@ -40,6 +46,17 @@ VECTOR_STORE_RECOVERY_MESSAGE = (
     "or a previous run may have left a partial HNSW segment on disk. Reset the "
     "Chroma index and re-index your documents."
 )
+
+_LEXICAL_INDEX_LOCK = RLock()
+_LEXICAL_INDEX_CACHE: dict[tuple[int, int], list[dict[str, Any]]] = {}
+_LEXICAL_VOCAB_CACHE: dict[tuple[int, int], frozenset[str]] = {}
+
+# Partial-match reach for keyword retrieval. A query fragment of at least this length
+# matches any indexed term it is a substring of (and vice versa), so "sapi" finds
+# "sapiens", "chro" finds "chromosome", and arbitrary fragment combinations still
+# retrieve. Shorter fragments fall back to exact match so they don't pull in almost
+# everything as the corpus grows.
+PARTIAL_MATCH_MIN_LEN = 3
 
 
 class EmbeddingUnavailableError(RuntimeError):
@@ -83,39 +100,6 @@ class SentenceTransformerEmbedder:
         return [v.tolist() for v in vecs]
 
 
-class OllamaEmbedder:
-    """Alternative: Ollama-based embedder (requires Ollama service running locally)."""
-
-    def __init__(self, model: str = "nomic-embed-text", base_url: str = "http://localhost:11434") -> None:
-        self.model = model
-        self.base_url = base_url.rstrip("/")
-
-    def embed(self, texts: Iterable[str]) -> list[list[float]]:
-        return [self._embed_one(text) for text in texts]
-
-    def _embed_one(self, text: str) -> list[float]:
-        payload = json.dumps({"model": self.model, "prompt": text}).encode("utf-8")
-        request = urllib.request.Request(
-            f"{self.base_url}/api/embeddings",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=10.0) as response:
-                data = json.loads(response.read().decode("utf-8"))
-                embedding = data.get("embedding")
-                if isinstance(embedding, list):
-                    return embedding
-        except Exception as exc:
-            raise EmbeddingUnavailableError(
-                f"Ollama retrieval encoder is unavailable at {self.base_url}."
-            ) from exc
-        raise EmbeddingUnavailableError(
-            f"Ollama model {self.model!r} returned an invalid embedding."
-        )
-
-
 def collection_count(collection) -> int:
     try:
         return collection.count()
@@ -156,6 +140,141 @@ def lexical_terms(text: str) -> set[str]:
             token = token[:-1]
         terms.add(token)
     return terms
+
+
+def clear_lexical_index_cache() -> None:
+    """Drop the in-memory keyword snapshot after corpus writes or reset."""
+    with _LEXICAL_INDEX_LOCK:
+        _LEXICAL_INDEX_CACHE.clear()
+        _LEXICAL_VOCAB_CACHE.clear()
+
+
+def _term_matches(query_term: str, target_term: str) -> bool:
+    """Exact match, or — for query fragments of at least PARTIAL_MATCH_MIN_LEN — the
+    query fragment is contained in the indexed term ("sapi" -> "sapiens").
+
+    The match is one-directional on purpose: we expand the *typed* fragment outward to
+    longer indexed terms, but we never treat a short indexed word as a match for a long
+    typed word. Otherwise a precise query like "metabolism" would dredge up every chunk
+    containing "meta", "bol", "ism", etc."""
+    if query_term == target_term:
+        return True
+    if len(query_term) < PARTIAL_MATCH_MIN_LEN:
+        return False
+    return query_term in target_term
+
+
+def expand_query_terms(query_terms: set[str], vocabulary: frozenset[str]) -> dict[str, set[str]]:
+    """Map each query fragment to the indexed vocabulary terms it matches (incl. partials).
+
+    The vocabulary is scanned once per query rather than per chunk, so partial matching
+    stays cheap even as the Evidence Store grows: the per-chunk step below is then a plain
+    set intersection against the union of matched terms.
+    """
+    expanded: dict[str, set[str]] = {}
+    for term in query_terms:
+        if len(term) < PARTIAL_MATCH_MIN_LEN:
+            expanded[term] = {term} if term in vocabulary else set()
+        else:
+            expanded[term] = {vocab_term for vocab_term in vocabulary if term in vocab_term}
+    return expanded
+
+
+def partial_overlap(query_terms: set[str], target_terms: set[str]) -> int:
+    """Count target terms matching any query fragment (exact or partial). Used at the
+    sentence level, where the target set is small enough for a direct scan."""
+    return sum(
+        1 for target in target_terms
+        if any(_term_matches(term, target) for term in query_terms)
+    )
+
+
+def _metadata_matches(metadata: dict, metadata_filter: dict | None) -> bool:
+    """Small in-memory subset of Chroma where matching used by this project."""
+    if not metadata_filter:
+        return True
+    for key, expected in metadata_filter.items():
+        actual = metadata.get(key)
+        if isinstance(expected, dict):
+            if "$eq" in expected and actual != expected["$eq"]:
+                return False
+            if "$in" in expected and actual not in expected["$in"]:
+                return False
+            unsupported = set(expected) - {"$eq", "$in"}
+            if unsupported:
+                return False
+        elif actual != expected:
+            return False
+    return True
+
+
+def warm_lexical_index(collection) -> int:
+    """Build/reuse the full in-memory keyword snapshot and return its row count."""
+    return len(_lexical_snapshot(collection, collection_count(collection)))
+
+
+def _lexical_snapshot(collection, count: int | None = None) -> list[dict[str, Any]]:
+    """Fetch documents once, cache token sets in RAM, then serve keyword queries in ms."""
+    if count is None:
+        count = collection_count(collection)
+    if count == 0:
+        return []
+
+    key = (id(collection), count)
+    with _LEXICAL_INDEX_LOCK:
+        cached = _LEXICAL_INDEX_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+    try:
+        result = collection.get(include=["documents", "metadatas"])
+    except Exception as exc:
+        raise _vector_store_error(exc) from exc
+
+    documents = result.get("documents", []) or []
+    metadatas = result.get("metadatas", []) or []
+    snapshot = [
+        {
+            "document": document or "",
+            "metadata": metadata or {},
+            "terms": lexical_terms(document or ""),
+        }
+        for document, metadata in zip(documents, metadatas)
+    ]
+    with _LEXICAL_INDEX_LOCK:
+        stale_keys = [cache_key for cache_key in _LEXICAL_INDEX_CACHE if cache_key[0] == id(collection)]
+        for cache_key in stale_keys:
+            _LEXICAL_INDEX_CACHE.pop(cache_key, None)
+        _LEXICAL_INDEX_CACHE[key] = snapshot
+    return snapshot
+
+
+def _lexical_vocabulary(collection, count: int | None = None) -> frozenset[str]:
+    """Union of every indexed term — the keyword vocabulary used to expand partial
+    queries. Built once from the snapshot and cached alongside it (same count key, so it
+    is rebuilt automatically whenever the corpus changes size)."""
+    if count is None:
+        count = collection_count(collection)
+    if count == 0:
+        return frozenset()
+
+    key = (id(collection), count)
+    with _LEXICAL_INDEX_LOCK:
+        cached = _LEXICAL_VOCAB_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+    vocabulary: set[str] = set()
+    for item in _lexical_snapshot(collection, count):
+        vocabulary.update(item["terms"])
+    frozen = frozenset(vocabulary)
+
+    with _LEXICAL_INDEX_LOCK:
+        stale_keys = [cache_key for cache_key in _LEXICAL_VOCAB_CACHE if cache_key[0] == id(collection)]
+        for cache_key in stale_keys:
+            _LEXICAL_VOCAB_CACHE.pop(cache_key, None)
+        _LEXICAL_VOCAB_CACHE[key] = frozen
+    return frozen
 
 
 _CHUNK_HEADER = re.compile(
@@ -209,7 +328,7 @@ def _sentence_candidates(query: str, rows: list[dict]) -> list[tuple[int, float,
     for row in rows[:MAX_ANSWER_ROWS]:
         for segment, metadata in iter_document_segments(row):
             for sentence in extract_sentences(segment):
-                overlap = len(terms & lexical_terms(sentence))
+                overlap = partial_overlap(terms, lexical_terms(sentence))
                 candidates.append((overlap, row["score"], sentence, metadata))
     return candidates
 
@@ -553,39 +672,44 @@ def lexical_retrieve(
     n_results: int = 8,
     metadata_filter: dict | None = None,
 ) -> list[dict]:
-    """Deterministic fallback when the semantic retrieval encoder is unavailable."""
-    if collection_count(collection) == 0:
+    """Deterministic keyword retrieval backed by a cached in-memory lexical snapshot.
+
+    Query fragments are expanded against the indexed vocabulary first, so partial words
+    ("sapi" -> "sapiens") and arbitrary fragment combinations still retrieve evidence.
+    """
+    count = collection_count(collection)
+    if count == 0:
         return []
     query_terms = lexical_terms(query)
     if not query_terms:
         return []
 
-    get_params: dict[str, Any] = {"include": ["documents", "metadatas"]}
-    if metadata_filter:
-        get_params["where"] = metadata_filter
-    try:
-        result = collection.get(**get_params)
-    except Exception as exc:
-        raise _vector_store_error(exc) from exc
+    vocabulary = _lexical_vocabulary(collection, count)
+    expanded = expand_query_terms(query_terms, vocabulary)
+    matchable: set[str] = set().union(*expanded.values()) if expanded else set()
+    if not matchable:
+        return []
 
     ranked: list[tuple[int, float, dict]] = []
-    documents = result.get("documents", []) or []
-    metadatas = result.get("metadatas", []) or []
-    for document, metadata in zip(documents, metadatas):
-        document_terms = lexical_terms(document or "")
-        overlap = query_terms & document_terms
-        if not overlap:
+    for item in _lexical_snapshot(collection, count):
+        metadata = item["metadata"]
+        if not _metadata_matches(metadata, metadata_filter):
             continue
-        coverage = len(overlap) / len(query_terms)
-        specificity = len(overlap) / max(1, len(document_terms) ** 0.5)
+        document_terms = item["terms"]
+        matched = document_terms & matchable
+        if not matched:
+            continue
+        covered = sum(1 for hits in expanded.values() if document_terms & hits)
+        coverage = covered / len(query_terms)
+        specificity = len(matched) / max(1, len(document_terms) ** 0.5)
         score = max(0.0, min(1.0, coverage + min(0.2, specificity / 4)))
         row = {
-            "document": document,
+            "document": item["document"],
             "metadata": metadata or {},
             "distance": 1.0 - score,
             "score": score,
         }
-        ranked.append((len(overlap), score, row))
+        ranked.append((len(matched), score, row))
 
     ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
     return [row for _, _, row in ranked[:n_results]]
@@ -604,6 +728,8 @@ def self_debate_refine(query: str, rows: list[dict], model: str = DEFAULT_DLLM_M
     """
     if not rows:
         return []
+    if RETRIEVAL_ONLY:
+        return rows
     if not DEFAULT_DLLM_API_URL:
         return rows
 
@@ -656,6 +782,7 @@ def instant_answer(
     cache_enabled: bool = True,
     metadata_filter: dict | None = None,
     debate_enabled: bool = False,
+    keyword_only: bool = False,
 ) -> dict:
     """The contract the UI consumes: query -> grounded instant answer + provenance.
 
@@ -663,18 +790,18 @@ def instant_answer(
     then assembles the extractive answer. No LLM is involved unless debate_enabled=True.
     """
     category = classify_query(query)
-    sig = corpus_signature(collection)
+    sig = "keyword_only" if keyword_only else corpus_signature(collection)
 
-    retrieval_mode = "hybrid"
+    retrieval_mode = "keyword_only" if keyword_only else "hybrid"
     try:
-        hit = cache.lookup(query, sig) if cache_enabled else None
+        hit = cache.lookup(query, sig) if cache_enabled and not keyword_only else None
     except EmbeddingUnavailableError:
         hit = None
         retrieval_mode = "lexical_fallback"
     if hit:
         rows, from_cache, similarity = hit["rows"], True, hit["similarity"]
     else:
-        if retrieval_mode == "lexical_fallback":
+        if retrieval_mode in {"keyword_only", "lexical_fallback"}:
             rows = lexical_retrieve(collection, query, n_results=top_k, metadata_filter=metadata_filter)
         else:
             try:
@@ -703,7 +830,7 @@ def instant_answer(
     # Reference expansion: pull adjacent chunks and resolve explicit cross-refs
     # (Section X.Y, Figure N…) so the LLM context window contains the referenced
     # content. Expansion rows are invisible to extractive-bullet scoring.
-    if rows and retrieval_mode != "lexical_fallback":
+    if rows and retrieval_mode == "hybrid":
         try:
             rows = expand_cross_refs(collection, rows, embedder)
         except Exception:

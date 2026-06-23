@@ -2,7 +2,7 @@
 
 A multi-domain Retrieval-Augmented and Cache-Augmented Generation (RAG+CAG) system for the Canadian Light Source (CLS), built with Streamlit, FastAPI, and ChromaDB. Supports six research disciplines indexed as separate metadata-gated scopes.
 
-Retrieval is semantic (sentence-transformers `all-MiniLM-L6-v2`, fully offline on CPU) with a lexical keyword scan running in parallel as a safety net, plus natural-language query repair so messy human phrasing maps to the right vector.
+Temporary fast mode is enabled by default: generation is disabled and queries use deterministic keyword retrieval for millisecond lookups on the prototype corpus. Set `CLS_RETRIEVAL_ONLY=0` and `CLS_KEYWORD_ONLY=0` to restore hybrid semantic retrieval plus optional carrier synthesis.
 
 ## Research Domains
 
@@ -20,7 +20,7 @@ Tag each document at upload time using the **Assign a research domain** selector
 
 ## Architecture
 
-DocuSearch-inspired: retrieval is instant and primary. The grounded extractive answer from the RAG/CAG layer is always shown first. An optional generative carrier (default: OpenRouter · `openai/gpt-oss-120b`) synthesizes a direct answer from the same evidence rows.
+DocuSearch-inspired: retrieval is instant and primary. The grounded extractive answer from the RAG/CAG layer is always shown first. Optional generative carrier synthesis (default: OpenRouter · `openai/gpt-oss-120b`) is currently blocked by retrieval-only mode.
 
 | # | Component | File |
 | --- | --- | --- |
@@ -33,7 +33,7 @@ DocuSearch-inspired: retrieval is instant and primary. The grounded extractive a
 
 The landing page offers two entry points:
 
-- **Full App** — all roles (Admin / Scientist / Staff / User), corpus admin, upload, precision controls, graded eval, optional LLM synthesis.
+- **Full App** — Admin / User roles, corpus admin, upload, precision controls, graded eval, optional LLM synthesis.
 - **Ask Lane** — bright llama.cui-style chat interface for non-technical users: chat input → cited answer with source chips, conversation history, no LLM, no engineering telemetry. Instant retrieval only, for speed.
 
 Both UIs share the same underlying retrieval backend.
@@ -44,9 +44,18 @@ Both UIs share the same underlying retrieval backend.
 ./scripts/launch_cls.sh
 ```
 
-Creates `.venv` if needed, installs packages, and opens the UI at `http://localhost:8501`. Does not start Ollama or pull any LLM. On first run the embedder (`all-MiniLM-L6-v2`, ~80 MB) downloads once to `~/.cache/huggingface/`; after that it runs fully offline.
+Creates `.venv` if needed, installs packages, and opens the UI at `http://localhost:8501`. Does not start Ollama or pull any LLM.
+
+Fast mode defaults:
+
+```bash
+export CLS_RETRIEVAL_ONLY=1
+export CLS_KEYWORD_ONLY=1
+```
 
 ### Carrier (optional, Full App synthesis)
+
+Carrier calls are disabled while `CLS_RETRIEVAL_ONLY=1`. To test generation again, set `CLS_RETRIEVAL_ONLY=0` and `CLS_KEYWORD_ONLY=0` before launch.
 
 The carrier is any OpenAI-compatible `/v1/chat/completions` endpoint. Pick one — no code change:
 
@@ -78,7 +87,7 @@ Key endpoints:
 ```text
 GET  /health
 POST /v1/query
-POST /v1/chat/completions   # models: cls-rag-cag-v1.0 | CLS_DLLM_MODEL
+POST /v1/chat/completions   # cls-rag-cag-v1.0; CLS_DLLM_MODEL only when retrieval-only is off
 GET  /v1/dllm/status
 POST /v1/dllm/chat
 ```
@@ -94,7 +103,7 @@ curl http://127.0.0.1:8010/v1/query \
 ## Indexing Documents
 
 - **Admin sidebar**: one-click index of the local literature test corpus (`data/training_corpus/test_books` by default; override with `CLS_DEFAULT_DOCUMENTS_DIR`).
-- **Admin / Scientist sidebar**: drag-and-drop batch upload of PDF, TXT, MD, DOCX, HTML, CSV, TSV, and JSON with domain tagging.
+- **Admin sidebar**: drag-and-drop batch upload of PDF, TXT, MD, DOCX, HTML, CSV, TSV, and JSON with domain tagging.
 - **`ingest_daemon.py`**: optional batch indexer for folder-watch experiments.
 
 > **Upgrading from v1.1?** The encoder changed to 384d MiniLM, so collections were renamed `cls_v2_*`. Hit **Reset Chroma index** in the admin sidebar and re-index once.
@@ -114,5 +123,4 @@ A fixed floating overlay (bottom-right) shows live session telemetry for dev use
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Inference carrier](docs/DLLM.md)
-- [Safety flags](docs/SAFETY.md)
 - [User guide](docs/USER_GUIDE.md)

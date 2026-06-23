@@ -63,10 +63,14 @@ pick_python
 ensure_venv
 ensure_requirements
 
-if [ -n "${CLS_DLLM_API_URL:-}" ]; then
-    say "Inference carrier endpoint: $CLS_DLLM_API_URL"
+if [ "${CLS_RETRIEVAL_ONLY:-1}" = "0" ] || [ "${CLS_RETRIEVAL_ONLY:-1}" = "false" ]; then
+    if [ -n "${CLS_DLLM_API_URL:-}" ]; then
+        say "Inference carrier endpoint: $CLS_DLLM_API_URL"
+    else
+        say "Using default inference carrier endpoint unless overridden by CLS_DLLM_API_URL."
+    fi
 else
-    say "Using default inference carrier endpoint unless overridden by CLS_DLLM_API_URL."
+    say "Retrieval-only mode active; carrier proxy endpoints are disabled."
 fi
 
 if [ "${LAUNCHER_DRY_RUN:-0}" = "1" ]; then

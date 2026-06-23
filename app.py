@@ -17,7 +17,9 @@ from cls_config import (
     DEFAULT_DOCUMENT_DOMAIN,
     DEFAULT_DLLM_MODEL,
     DEFAULT_DOCUMENTS_DIR,
+    KEYWORD_ONLY_RETRIEVAL,
     RESEARCH_SCOPES,
+    RETRIEVAL_ONLY,
 )
 from cls_service import (
     ask_manual,
@@ -34,6 +36,7 @@ from cls_service import (
     ingest_path,
     reset_collection,
     uploaded_signature,
+    warm_keyword_index,
 )
 from cls_backend.dllm import (
     CORRECTION_SYSTEM,
@@ -53,7 +56,7 @@ from cls_backend.query_repair import repair_query
 
 
 # --------------------------------------------------------------------------- #
-# Role tiers. The left sidebar delegates one of four paths; each role reshapes
+# Role tiers. The left sidebar delegates one of two paths; each role reshapes
 # the screen by capability. Corpus lifecycle (indexing/reset) is admin-specific;
 # lower tiers narrow down to a clean ask-and-read surface. This is a visual +
 # permission separation only — it does not change how chunks are embedded.
@@ -65,18 +68,6 @@ ROLES: dict[str, dict] = {
         "tagline": "Full control — corpus lifecycle, tuning, and evaluation.",
         "caps": {"index", "upload", "reindex", "reset", "tune", "cag_tune", "dllm", "eval"},
     },
-    "Scientist": {
-        "glyph": "🔬",
-        "accent": "#6aa9ff",
-        "tagline": "Bring your own docs and query with full precision controls.",
-        "caps": {"upload", "reindex", "tune", "cag_tune", "dllm", "eval"},
-    },
-    "Staff": {
-        "glyph": "🛠",
-        "accent": "#ffb347",
-        "tagline": "Ask questions and see what documents are indexed. Read-only corpus.",
-        "caps": {"cag_toggle"},
-    },
     "User": {
         "glyph": "👤",
         "accent": "#6fd58a",
@@ -85,14 +76,13 @@ ROLES: dict[str, dict] = {
     },
 }
 ROLE_NAMES = list(ROLES)
-# Architecture: ONE active *local* model — the embedding Retrieval Encoder (sentence-transformers).
-# Retrieval is primary, followed by an optional relevance-audit pass to reduce clutter.
-# The generative answer is carried by an external OpenAI-compatible LLM — default 
-# carrier OpenRouter · openai/gpt-oss-120b.
+# Architecture: retrieval is primary. During the temporary speed-first phase,
+# CLS_RETRIEVAL_ONLY disables every LLM augmentation path and CLS_KEYWORD_ONLY skips
+# semantic query embedding for deterministic keyword retrieval.
 DLLM_MODEL = DEFAULT_DLLM_MODEL
 
 st.set_page_config(
-    page_title=f"CLS dsRAG Prototype · {APP_VERSION}",
+    page_title=f"CLS RAG+CAG Prototype · {APP_VERSION}",
     page_icon="🔬",
     layout="wide",
 )
@@ -174,6 +164,7 @@ def query_backend(query: str, top_k: int, cache_enabled: bool, min_similarity: f
                 "min_similarity": min_similarity,
                 "metadata_filter": metadata_filter,
                 "debate_enabled": debate_enabled,
+                "keyword_only": KEYWORD_ONLY_RETRIEVAL,
             },
         )
     return ask_manual(
@@ -183,6 +174,7 @@ def query_backend(query: str, top_k: int, cache_enabled: bool, min_similarity: f
         min_similarity=min_similarity,
         metadata_filter=metadata_filter,
         debate_enabled=debate_enabled,
+        keyword_only=KEYWORD_ONLY_RETRIEVAL,
     )
 
 
@@ -198,6 +190,8 @@ def dllm_api_status() -> dict:
         "model": DLLM_MODEL,
         "configured": False,
         "online": False,
+        "disabled": RETRIEVAL_ONLY,
+        "retrieval_only": RETRIEVAL_ONLY,
         "detail": f"Start the API bridge at {API_URL}, or use embedded retrieval-only mode.",
     }
 
@@ -374,12 +368,18 @@ def render_answer_component(
             "Semantic retrieval is offline, so these rows were ranked with the deterministic "
             "text fallback. Start Ollama with `nomic-embed-text` to restore semantic ranking."
         )
+    citation_note = (
+        "Retrieval-only mode: row numbers are evidence labels; extractive citations name "
+        "the source document and page directly."
+        if RETRIEVAL_ONLY
+        else "Carrier citations like [1] refer to these row numbers; extractive citations "
+             "name the source document and page directly."
+    )
     st.markdown(
         '<div class="cls-evidence-strip">'
         '<div class="cls-evidence-title">Chroma-ranked evidence rows, not model output</div>'
         f'<div class="cls-evidence-copy">{evidence_summary}</div>'
-        f'<div class="cls-evidence-copy">Carrier citations like [1] refer to these row numbers; '
-        f'extractive citations name the source document and page directly.</div>'
+        f'<div class="cls-evidence-copy">{citation_note}</div>'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -549,11 +549,14 @@ def _render_turn(message: dict) -> None:
 
 
 def _render_ask_lane() -> None:
-    """Two-pass chat lane: Pass 1 = instant RAG/CAG extraction, Pass 2 = streaming LLM augmentation."""
+    """Chat lane over instant RAG/CAG extraction."""
     dllm_online = dllm_api_status().get("online", False)
     dllm_model = dllm_api_status().get("model", DLLM_MODEL) if dllm_online else None
 
-    pass2_label = "RAG/CAG + AI augmentation" if dllm_online else "RAG/CAG · extractive only"
+    if RETRIEVAL_ONLY:
+        pass2_label = "keyword retrieval only" if KEYWORD_ONLY_RETRIEVAL else "retrieval only"
+    else:
+        pass2_label = "RAG/CAG + AI augmentation" if dllm_online else "RAG/CAG · extractive only"
     st.markdown(
         _BRIGHT_LANE_CSS +
         f"""<div class="lane-hero">
@@ -566,11 +569,13 @@ def _render_ask_lane() -> None:
 
     with st.sidebar:
         st.header("Research Scope")
-        st.caption("Filter retrieval to a specific research discipline.")
-        selected_scope = st.radio("Active scope", list(RESEARCH_SCOPES.keys()), label_visibility="collapsed")
+        st.caption("Filter retrieval to a specific CLS beamline.")
+        selected_scope = st.selectbox("Active scope", list(RESEARCH_SCOPES.keys()), label_visibility="collapsed")
         active_mfilter = RESEARCH_SCOPES[selected_scope]
         st.divider()
-        if dllm_online:
+        if RETRIEVAL_ONLY:
+            st.caption("💬 AI augmentation disabled — retrieval-only mode.")
+        elif dllm_online:
             st.caption(f"💬 AI augmentation: {dllm_model}")
         else:
             st.caption("💬 AI augmentation offline — extractive only.")
@@ -613,7 +618,7 @@ def _render_ask_lane() -> None:
             # Pass 1 — instant RAG/CAG: retrieval + extractive bullets.        #
             # ---------------------------------------------------------------- #
             try:
-                result = query_backend(query, 16, True, 0.97, metadata_filter=active_mfilter)
+                result = query_backend(query, 16, True, 0.80, metadata_filter=active_mfilter)
             except RuntimeError as exc:
                 st.error(str(exc))
 
@@ -744,7 +749,7 @@ def _home_gate() -> None:
             st.markdown(
                 '<div class="cls-mode-card">'
                 '<h4>🛡 Full App</h4>'
-                '<p>All roles, corpus admin, upload, eval, and precision controls.</p>'
+                '<p>Admin &amp; User roles — corpus admin, upload, eval, and precision controls.</p>'
                 '</div>',
                 unsafe_allow_html=True,
             )
@@ -894,7 +899,6 @@ st.markdown(
       .tok { border-radius: 6px; padding: 0 0.28em; font-weight: 600; }
       .tok-phone  { color: #a8480f; background: #fcebdd; box-shadow: inset 0 0 0 1px rgba(244,120,31,0.40); }
       .tok-acr    { color: #b3203f; background: #fbe2e7; box-shadow: inset 0 0 0 1px rgba(224,57,92,0.35); }
-      .tok-safety { color: #c01838; text-decoration: underline; text-decoration-color: #ff4d6d; text-underline-offset: 3px; font-weight: 700; }
       .tok-cite   { color: #8a7a74; font-weight: 500; font-size: 0.9em; }
       /* DocuSearch-style query-term hit highlight. */
       .tok-hit    { color: #1f6b38; background: #d6f3df; box-shadow: inset 0 0 0 1px rgba(47,158,87,0.45); }
@@ -1037,6 +1041,11 @@ st.markdown(
 
 dllm_endpoint = dllm_api_status()
 dllm_api_online = bool(dllm_endpoint.get("online"))
+if KEYWORD_ONLY_RETRIEVAL:
+    try:
+        warm_keyword_index()
+    except RuntimeError:
+        pass
 
 _home_gate()
 
@@ -1130,7 +1139,7 @@ def _render_corpus_admin() -> None:
 
 
 def _render_upload_section() -> None:
-    """Admin + Scientist path: drag-and-drop a whole batch of docs and index them at once."""
+    """Admin path: drag-and-drop a whole batch of docs and index them at once."""
     st.subheader("📥 Upload & index documents")
     st.caption(
         "Drag and drop a batch of files into the drop zone below — PDF, TXT, MD, DOCX, "
@@ -1149,7 +1158,7 @@ def _render_upload_section() -> None:
         with st.expander(f"Files queued for indexing ({len(sizes)})", expanded=False):
             st.markdown("\n".join(f"- {name} — {_human_size(size)}" for name, size in sizes))
     
-    scope_tag = st.selectbox("Assign a research domain:", list(RESEARCH_SCOPES.keys()), index=0)
+    scope_tag = st.selectbox("Assign a beamline:", list(RESEARCH_SCOPES.keys()), index=0)
     extra_meta = RESEARCH_SCOPES[scope_tag] or {}
 
     reindex_uploads = (
@@ -1221,11 +1230,10 @@ def _render_upload_section() -> None:
 # Defaults so every role path has these names defined even when its tier hides
 # the control that would otherwise set them.
 cag_enabled = True
-min_similarity = 0.97
+min_similarity = 0.80
 dllm_enabled = False
-# Synthesis defaults ON whenever the carrier is ready, even for tiers that never
-# see the toggle — the natural-language answer is the headline for every role.
-synth_enabled = dllm_api_online
+# Synthesis is unavailable in temporary retrieval-only mode.
+synth_enabled = False if RETRIEVAL_ONLY else dllm_api_online
 answer_mode = "Grounded"
 
 with st.sidebar:
@@ -1245,13 +1253,18 @@ with st.sidebar:
     )
 
     st.header("Research Scope")
-    st.caption("Filter retrieval to a specific synchrotron research discipline.")
-    selected_scope = st.radio("Active scope", list(RESEARCH_SCOPES.keys()), label_visibility="collapsed")
+    st.caption("Filter retrieval to a specific CLS beamline.")
+    selected_scope = st.selectbox("Active scope", list(RESEARCH_SCOPES.keys()), label_visibility="collapsed")
     active_mfilter = RESEARCH_SCOPES[selected_scope]
 
     st.header("Relevance Audit")
-    st.caption("Second-pass filtering for noisy retrieval sets before synthesis.")
-    debate_enabled = st.toggle("Enable evidence refinement", value=False)
+    if RETRIEVAL_ONLY:
+        st.caption("Disabled in retrieval-only mode; no carrier calls are made.")
+        debate_enabled = False
+        st.toggle("Enable evidence refinement", value=False, disabled=True)
+    else:
+        st.caption("Second-pass filtering for noisy retrieval sets before synthesis.")
+        debate_enabled = st.toggle("Enable evidence refinement", value=False)
 
     if role_can("index"):
         _render_corpus_admin()
@@ -1272,16 +1285,11 @@ with st.sidebar:
         st.header("♻ CAG Layer")
         st.caption("Semantic cache of prior question → retrieved evidence.")
         cag_enabled = st.toggle("Reuse cached evidence", value=True)
-        min_similarity = st.slider("Min similarity for a cache hit", 0.80, 1.00, 0.97, 0.01)
+        min_similarity = st.slider("Min similarity for a cache hit", 0.80, 1.00, 0.80, 0.01)
         st.metric("Cached queries", get_cache().count())
         if st.button("Clear answer cache", use_container_width=True):
             get_cache().clear()
             st.success("CAG cache cleared.")
-    elif role_can("cag_toggle"):
-        st.header("♻ CAG Layer")
-        st.caption("Reuse evidence from prior identical questions.")
-        cag_enabled = st.toggle("Reuse cached evidence", value=True)
-        st.metric("Cached queries", get_cache().count())
 
     get_cache().distance_max = 1.0 - min_similarity
 
@@ -1289,45 +1297,49 @@ with st.sidebar:
         carrier_name = dllm_endpoint.get("carrier", "OpenRouter")
         model_name = display_model_name(DLLM_MODEL)
         st.header("💬 Inference carrier")
-        st.caption(
-            f"{carrier_name} · {DLLM_MODEL}. The carrier writes the optional synthesis only; "
-            "document names, pages, and evidence rows always come from Chroma retrieval."
-        )
-        # Single on/off for carrier synthesis — the generative RAG path, ON by default once the
-        # carrier is ready (key present + reachable).
-        synth_enabled = st.toggle(
-            f"Synthesize answer with {model_name}",
-            value=dllm_api_online,
-            disabled=not dllm_api_online,
-            help="Reads the question + retrieval evidence and writes a direct answer. Off falls "
-                 "back to deterministic extraction.",
-        )
-        # Carrier scope: Grounded (default) keeps the strict trust contract — answer only from the
-        # indexed documents, else refuse. Hybrid lets the carrier also answer general / natural-
-        # language questions from its own knowledge when the documents don't cover them.
-        answer_mode = st.radio(
-            "Answer mode",
-            ["Grounded", "Hybrid"],
-            horizontal=True,
-            disabled=not (dllm_api_online and synth_enabled),
-            help="Grounded · answers strictly from the indexed documents (refuses otherwise). "
-                 "Hybrid · also answers general questions from the model's own knowledge.",
-        )
-        st.caption(
-            "**Grounded** answers only from your indexed documents. **Hybrid** also answers "
-            "natural-language / general questions from the model when the documents don't cover them."
-        )
-        # Secondary, optional: let the same carrier also repair PDF extraction artifacts in the
-        # grounded bullets. Off by default; orthogonal to the generative answer above.
-        dllm_enabled = st.checkbox(
-            "Also clean extraction with carrier",
-            value=False,
-            disabled=not dllm_api_online,
-            help="Applies a guarded in-place correction to the extractive bullets (never invents "
-                 "facts). Independent of the generative answer toggle.",
-        )
-        if not dllm_api_online:
+        if RETRIEVAL_ONLY:
             st.caption(dllm_endpoint.get("detail", "Carrier offline — retrieval evidence and extraction still work."))
+            st.caption("Set `CLS_RETRIEVAL_ONLY=0` before launch to re-enable generation.")
+        else:
+            st.caption(
+                f"{carrier_name} · {DLLM_MODEL}. The carrier writes the optional synthesis only; "
+                "document names, pages, and evidence rows always come from Chroma retrieval."
+            )
+            # Single on/off for carrier synthesis — the generative RAG path, ON by default once the
+            # carrier is ready (key present + reachable).
+            synth_enabled = st.toggle(
+                f"Synthesize answer with {model_name}",
+                value=dllm_api_online,
+                disabled=not dllm_api_online,
+                help="Reads the question + retrieval evidence and writes a direct answer. Off falls "
+                     "back to deterministic extraction.",
+            )
+            # Carrier scope: Grounded (default) keeps the strict trust contract — answer only from the
+            # indexed documents, else refuse. Hybrid lets the carrier also answer general / natural-
+            # language questions from its own knowledge when the documents don't cover them.
+            answer_mode = st.radio(
+                "Answer mode",
+                ["Grounded", "Hybrid"],
+                horizontal=True,
+                disabled=not (dllm_api_online and synth_enabled),
+                help="Grounded · answers strictly from the indexed documents (refuses otherwise). "
+                     "Hybrid · also answers general questions from the model's own knowledge.",
+            )
+            st.caption(
+                "**Grounded** answers only from your indexed documents. **Hybrid** also answers "
+                "natural-language / general questions from the model when the documents don't cover them."
+            )
+            # Secondary, optional: let the same carrier also repair PDF extraction artifacts in the
+            # grounded bullets. Off by default; orthogonal to the generative answer above.
+            dllm_enabled = st.checkbox(
+                "Also clean extraction with carrier",
+                value=False,
+                disabled=not dllm_api_online,
+                help="Applies a guarded in-place correction to the extractive bullets (never invents "
+                     "facts). Independent of the generative answer toggle.",
+            )
+            if not dllm_api_online:
+                st.caption(dllm_endpoint.get("detail", "Carrier offline — retrieval evidence and extraction still work."))
 
     if not role_can("index") and not role_can("upload"):
         st.markdown(
@@ -1341,7 +1353,7 @@ with st.sidebar:
         st.rerun()
 
 # Full-width drag-and-drop batch upload — roomy drop target for many files at once,
-# shown above the ask/answer columns for upload-capable tiers (Admin / Scientist).
+# shown above the ask/answer columns for the upload-capable tier (Admin).
 if role_can("upload"):
     _render_upload_section()
     st.divider()
@@ -1350,6 +1362,8 @@ left, right = st.columns([1.05, 1], gap="large")
 
 with left:
     st.subheader("🔎 Search documents")
+    if KEYWORD_ONLY_RETRIEVAL:
+        st.caption("Temporary fast mode: deterministic keyword retrieval, no generation.")
 
     query = st.text_area(
         "Research query",
@@ -1367,8 +1381,8 @@ with left:
         unsafe_allow_html=True,
     )
 
-    # Top-K is a precision knob — only the tuning tiers (Admin / Scientist) see it;
-    # operating tiers (Staff / User) run on a sensible fixed default.
+    # Top-K is a precision knob — only Admin sees it;
+    # User runs on a sensible fixed default.
     top_k = st.slider("Top-K chunks", 3, 24, 16) if role_can("tune") else 16
 
     if st.button("Search Documents", type="primary", use_container_width=True):
@@ -1394,15 +1408,18 @@ with left:
                 st.session_state["last_retrieval_mode"] = result.get("retrieval_mode", "semantic")
                 # Carrier cleanup is separate from synthesis. If enabled, arm it only when
                 # the instant text shows artifacts worth correcting.
-                activate, reason = needs_correction(result["answer"])
+                activate, reason = (
+                    needs_correction(result["answer"])
+                    if dllm_api_online and dllm_enabled and not RETRIEVAL_ONLY
+                    else (False, None)
+                )
                 st.session_state["last_dllm"] = {
                     "status": "pending" if (activate and result["answer"]) else "dormant",
                     "reason": reason,
                     "text": None,
                 }
-                # Generative answer (on by default when the carrier is ready): arm it for this
-                # query when the toggle is on, so the right column synthesises once and caches
-                # the text across reruns.
+                # Generative answer: only armed when retrieval-only mode is off and the
+                # synthesis toggle is enabled.
                 st.session_state["last_synth"] = {
                     "status": "pending" if synth_enabled else "off",
                     "text": None,
@@ -1442,10 +1459,13 @@ if eval_rows:
     st.dataframe(eval_rows, use_container_width=True, hide_index=True)
 
 st.divider()
+mode_bits = [
+    "retrieval-only" if RETRIEVAL_ONLY else f"{DLLM_MODEL} synthesis available",
+    "keyword-only" if KEYWORD_ONLY_RETRIEVAL else "hybrid semantic+keyword",
+]
 st.caption(
     f"{APP_VERSION} · CLS Synchrotron Research Query — DocuSearch-style RAG/CAG. "
-    "**HashEmbedder** → **CAG Layer** → **Evidence Store** (ChromaDB) → deterministic clean-parse. "
-    f"**{DLLM_MODEL}** synthesis via {dllm_endpoint.get('carrier', 'OpenRouter')} is on by default when keyed. "
-    "**Grounded** mode synthesizes strictly from retrieved evidence; **Hybrid** also draws on the model's knowledge. "
-    "Source documents and pages always come from Chroma, not the carrier. Fully offline-capable without a carrier key."
+    "**Evidence Store** (ChromaDB) → deterministic clean-parse. "
+    f"Mode: **{', '.join(mode_bits)}**. "
+    "Source documents and pages always come from Chroma retrieval."
 )

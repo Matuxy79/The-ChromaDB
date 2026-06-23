@@ -35,7 +35,7 @@ def _normalize(query: str) -> str:
 
 
 class SemanticEvidenceCache:
-    def __init__(self, collection, encoder, distance_max: float = 0.03) -> None:
+    def __init__(self, collection, encoder, distance_max: float = 0.20) -> None:
         self.collection = collection
         self.encoder = encoder
         self.distance_max = distance_max

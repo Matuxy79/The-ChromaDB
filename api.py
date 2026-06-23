@@ -8,14 +8,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from cls_config import APP_VERSION, DEFAULT_DLLM_MODEL
+from cls_config import APP_VERSION, DEFAULT_DLLM_MODEL, KEYWORD_ONLY_RETRIEVAL, RETRIEVAL_ONLY
 from cls_service import answer_text, ask_manual, call_dllm_api, dllm_status, service_status
 
 CLS_RAG_MODEL = "cls-rag-cag-v1.0"
 
 
 app = FastAPI(
-    title="CLS dsRAG+CAG API",
+    title="CLS RAG+CAG API",
     version=APP_VERSION,
     description="Shared RAG API plus inference carrier proxy for Streamlit, Chainlit, and OpenAI-compatible frontends.",
 )
@@ -32,9 +32,10 @@ class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1)
     top_k: int = Field(16, ge=1, le=24)
     cache_enabled: bool = True
-    min_similarity: float = Field(0.97, ge=0.0, le=1.0)
+    min_similarity: float = Field(0.80, ge=0.0, le=1.0)
     metadata_filter: dict | None = None
     debate_enabled: bool = False
+    keyword_only: bool | None = None
 
 
 class ChatMessage(BaseModel):
@@ -48,9 +49,10 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     top_k: int = Field(16, ge=1, le=24)
     cache_enabled: bool = True
-    min_similarity: float = Field(0.97, ge=0.0, le=1.0)
+    min_similarity: float = Field(0.80, ge=0.0, le=1.0)
     metadata_filter: dict | None = None
     debate_enabled: bool = False
+    keyword_only: bool | None = None
 
 
 class DllmChatRequest(BaseModel):
@@ -67,6 +69,7 @@ def _query_payload(request: QueryRequest) -> dict[str, Any]:
         min_similarity=request.min_similarity,
         metadata_filter=request.metadata_filter,
         debate_enabled=request.debate_enabled,
+        keyword_only=request.keyword_only,
     )
     return {
         "query": request.query,
@@ -94,22 +97,28 @@ def health() -> dict[str, Any]:
 
 @app.get("/v1/models")
 def models() -> dict[str, Any]:
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": CLS_RAG_MODEL,
-                "object": "model",
-                "created": 0,
-                "owned_by": "cls",
-            },
+    data = [
+        {
+            "id": CLS_RAG_MODEL,
+            "object": "model",
+            "created": 0,
+            "owned_by": "cls",
+        },
+    ]
+    if not RETRIEVAL_ONLY:
+        data.append(
             {
                 "id": DEFAULT_DLLM_MODEL,
                 "object": "model",
                 "created": 0,
                 "owned_by": "dllm-api",
-            },
-        ],
+            }
+        )
+    return {
+        "object": "list",
+        "data": data,
+        "retrieval_only": RETRIEVAL_ONLY,
+        "keyword_only": KEYWORD_ONLY_RETRIEVAL,
     }
 
 
@@ -123,6 +132,11 @@ def chat_completions(request: ChatCompletionRequest) -> dict[str, Any]:
     if request.stream:
         raise HTTPException(status_code=400, detail="Streaming is not implemented for the RAG endpoint yet.")
     if request.model == DEFAULT_DLLM_MODEL:
+        if RETRIEVAL_ONLY:
+            raise HTTPException(
+                status_code=403,
+                detail="Retrieval-only mode is active; LLM chat completions are disabled.",
+            )
         try:
             text = call_dllm_api(
                 [message.model_dump() for message in request.messages],
@@ -153,6 +167,7 @@ def chat_completions(request: ChatCompletionRequest) -> dict[str, Any]:
             min_similarity=request.min_similarity,
             metadata_filter=request.metadata_filter,
             debate_enabled=request.debate_enabled,
+            keyword_only=request.keyword_only,
         )
     )
     return {
@@ -179,6 +194,11 @@ def dllm_status_endpoint() -> dict[str, Any]:
 
 @app.post("/v1/dllm/chat")
 def dllm_chat(request: DllmChatRequest) -> dict[str, str]:
+    if RETRIEVAL_ONLY:
+        raise HTTPException(
+            status_code=403,
+            detail="Retrieval-only mode is active; LLM chat is disabled.",
+        )
     try:
         text = call_dllm_api(
             [message.model_dump() for message in request.messages],

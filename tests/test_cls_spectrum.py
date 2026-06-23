@@ -9,12 +9,6 @@ from cls_backend.spectrum import (
 
 
 class ClassifyQueryTests(unittest.TestCase):
-    def test_radiation_is_safety(self):
-        self.assertEqual(classify_query("is the shutter open, radiation exposure?"), "safety")
-
-    def test_safety_beats_other_keywords(self):
-        self.assertEqual(classify_query("phone for beryllium window swap"), "safety")
-
     def test_phone_is_contacts(self):
         self.assertEqual(classify_query("what is the phone number for the beamline"), "contacts")
 
@@ -52,11 +46,6 @@ class DecorateTests(unittest.TestCase):
         self.assertNotIn("< 5", out)
         self.assertIn("&lt;", out)
 
-    def test_safety_words_only_underlined_on_safety_category(self):
-        text = "Check the radiation interlock."
-        self.assertIn("tok-safety", decorate(text, "safety"))
-        self.assertNotIn("tok-safety", decorate(text, "general"))
-
 
 class GlowTests(unittest.TestCase):
     def test_high_score_brighter_than_low(self):
@@ -69,7 +58,7 @@ class GlowTests(unittest.TestCase):
         self.assertGreater(hi_blur, lo_blur)
 
     def test_score_clamped(self):
-        hue = SPECTRUM["safety"]["hue"]
+        hue = SPECTRUM["contacts"]["hue"]
         self.assertTrue(glow_css(hue, 5.0))
 
 if __name__ == "__main__":

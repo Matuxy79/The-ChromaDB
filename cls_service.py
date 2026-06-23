@@ -23,6 +23,8 @@ from cls_config import (
     DEFAULT_DLLM_API_KEY,
     DEFAULT_DLLM_API_URL,
     DEFAULT_DLLM_MODEL,
+    KEYWORD_ONLY_RETRIEVAL,
+    RETRIEVAL_ONLY,
     DEFAULT_PARROT_MODEL,
     DEFAULT_PARROT_URL,
 )
@@ -39,14 +41,20 @@ from cls_backend.dllm import (
 from cls_backend.pipeline import (
     EMBED_DIM,
     VECTOR_STORE_RECOVERY_MESSAGE,
-    OllamaEmbedder,
     SentenceTransformerEmbedder,
+    clear_lexical_index_cache,
     collection_count,
     expand_cross_refs,
     extract_cross_refs,
     instant_answer,
     retrieve,
+    warm_lexical_index,
 )
+
+
+# Embed + write this many chunks at a time during ingest. Bounds peak memory so a single
+# large document can't OOM the process on small-RAM hosts.
+INGEST_BATCH_SIZE = 256
 
 
 @dataclass(frozen=True)
@@ -265,16 +273,20 @@ def ingest_path(
     if not chunks:
         return 0, "no readable text found"
 
-    embeddings = (embedder or get_embedder()).embed(chunk.text for chunk in chunks)
+    active_embedder = embedder or get_embedder()
     chunk_ids = [chunk.chunk_id for chunk in chunks]
     write = collection.upsert if existing_ids else collection.add
+    # Embed and write in batches so a single large file never materialises all of its
+    # chunks + vectors in memory at once (that pattern OOM-kills on small-RAM hosts).
     try:
-        write(
-            ids=chunk_ids,
-            documents=[chunk.text for chunk in chunks],
-            metadatas=[chunk.metadata for chunk in chunks],
-            embeddings=embeddings,
-        )
+        for start in range(0, len(chunks), INGEST_BATCH_SIZE):
+            batch = chunks[start : start + INGEST_BATCH_SIZE]
+            write(
+                ids=[chunk.chunk_id for chunk in batch],
+                documents=[chunk.text for chunk in batch],
+                metadatas=[chunk.metadata for chunk in batch],
+                embeddings=active_embedder.embed(chunk.text for chunk in batch),
+            )
     except Exception as exc:
         raise RuntimeError(VECTOR_STORE_RECOVERY_MESSAGE) from exc
     stale_ids = list(set(existing_ids) - set(chunk_ids))
@@ -283,6 +295,7 @@ def ingest_path(
             collection.delete(ids=stale_ids)
         except Exception as exc:
             raise RuntimeError(VECTOR_STORE_RECOVERY_MESSAGE) from exc
+    clear_lexical_index_cache()
     return len(chunks), "indexed"
 
 
@@ -302,6 +315,12 @@ def reset_collection() -> None:
         _collection = None
         _cache_collection = None
         _cache = None
+        clear_lexical_index_cache()
+
+
+def warm_keyword_index() -> int:
+    """Preload the keyword snapshot so first user search avoids a full Chroma document fetch."""
+    return warm_lexical_index(get_collection())
 
 
 def evidence_breakdown(collection: chromadb.Collection | None = None) -> list[dict]:
@@ -377,10 +396,13 @@ def ask_manual(
     *,
     top_k: int = 16,
     cache_enabled: bool = True,
-    min_similarity: float = 0.97,
+    min_similarity: float = 0.80,
     metadata_filter: dict | None = None,
     debate_enabled: bool = False,
+    keyword_only: bool | None = None,
 ) -> dict:
+    if keyword_only is None:
+        keyword_only = KEYWORD_ONLY_RETRIEVAL
     cache = get_cache()
     cache.distance_max = 1.0 - min_similarity
     return instant_answer(
@@ -392,6 +414,7 @@ def ask_manual(
         cache_enabled=cache_enabled,
         metadata_filter=metadata_filter,
         debate_enabled=debate_enabled,
+        keyword_only=keyword_only,
     )
 
 
@@ -434,7 +457,12 @@ def dllm_status(timeout: float = 1.0) -> dict:
     carrier = _carrier_name(DEFAULT_DLLM_API_URL)
     online = False
 
-    if not configured:
+    if RETRIEVAL_ONLY:
+        detail = (
+            "Retrieval-only mode is active (CLS_RETRIEVAL_ONLY=1): LLM synthesis, "
+            "cleanup, self-debate, parrot phrasing, and proxy calls are disabled."
+        )
+    elif not configured:
         detail = "Set CLS_DLLM_API_URL to enable the gpt-oss-120b answer."
     elif not local and not has_key:
         # Remote carrier wired in, but no key yet — the on-by-default toggle stays disabled
@@ -466,6 +494,8 @@ def dllm_status(timeout: float = 1.0) -> dict:
         "has_key": has_key,
         "local": local,
         "online": online,
+        "disabled": RETRIEVAL_ONLY,
+        "retrieval_only": RETRIEVAL_ONLY,
         "detail": detail,
     }
 
@@ -484,6 +514,8 @@ def call_dllm_api(
     model: str = DEFAULT_DLLM_MODEL,
     timeout: float = 60.0,
 ) -> str:
+    if RETRIEVAL_ONLY:
+        raise RuntimeError("Retrieval-only mode is active; LLM generation is disabled.")
     if not DEFAULT_DLLM_API_URL:
         raise RuntimeError("Inference carrier is not configured. Set CLS_DLLM_API_URL.")
     if system:
@@ -536,6 +568,8 @@ def generate_answer(
     is the Hybrid path: the context is optional supporting material and the carrier may also
     answer from its own general knowledge, so it can respond even with no retrieved rows.
     """
+    if RETRIEVAL_ONLY:
+        raise RuntimeError("Retrieval-only mode is active; LLM generation is disabled.")
     if grounded and not rows:
         return ""
     system = ANSWER_SYSTEM if grounded else ASSIST_SYSTEM
@@ -561,6 +595,8 @@ def stream_generate_answer(
     Yields individual text tokens as they arrive so the caller can pass this directly to
     ``st.write_stream()`` for live rendering without waiting for the full response.
     """
+    if RETRIEVAL_ONLY:
+        raise RuntimeError("Retrieval-only mode is active; LLM generation is disabled.")
     if grounded and not rows:
         return
     if not DEFAULT_DLLM_API_URL:
@@ -603,6 +639,14 @@ def stream_generate_answer(
 
 def parrot_status(timeout: float = 1.0) -> dict:
     """Is the small local parrot model reachable? (Ollama OpenAI-compatible endpoint.)"""
+    if RETRIEVAL_ONLY:
+        return {
+            "online": False,
+            "model": DEFAULT_PARROT_MODEL,
+            "base_url": DEFAULT_PARROT_URL,
+            "disabled": True,
+            "detail": "Retrieval-only mode is active; parrot phrasing is disabled.",
+        }
     online = False
     try:
         request = urllib.request.Request(f"{DEFAULT_PARROT_URL}/models", method="GET")
@@ -618,7 +662,7 @@ def parrot_answer(sentences: list[str], *, timeout: float = 30.0) -> str | None:
     small local model. Returns None if the model is unavailable or if the output drifts from
     the evidence (invents a number) — the caller then falls back to the extractive bullets.
     """
-    if not sentences:
+    if RETRIEVAL_ONLY or not sentences:
         return None
     payload = json.dumps(
         {
@@ -653,7 +697,7 @@ def parrot_stream(sentences: list[str], *, timeout: float = 60.0):
     small local model. The grounded extractive answer stays the source of truth; this stream
     is the fallible 'human' layer on top. Yields nothing if the model is unavailable.
     """
-    if not sentences:
+    if RETRIEVAL_ONLY or not sentences:
         return
     payload = json.dumps(
         {
@@ -700,4 +744,6 @@ def service_status() -> dict:
         "cached_queries": get_cache().count(),
         "documents": evidence_breakdown(get_collection()),
         "dllm": dllm,
+        "retrieval_only": RETRIEVAL_ONLY,
+        "keyword_only": KEYWORD_ONLY_RETRIEVAL,
     }

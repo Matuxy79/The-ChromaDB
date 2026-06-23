@@ -14,18 +14,10 @@ from __future__ import annotations
 import html
 import re
 
-from cls_backend.safety import SAFETY_TOPICS as _SAFETY_WORDS, detect_safety_topic
-
 
 # Categories in visible-spectrum order.
-# Safety and contacts sit up front because they carry the strongest visual cue.
+# Contacts sits up front because it carries the strongest visual cue.
 SPECTRUM: dict[str, dict] = {
-    "safety": {
-        "hue": "#ff4d6d",
-        "glyph": "⚠",
-        "label": "Safety",
-        "triggers": [],  # resolved via detect_safety_topic
-    },
     "contacts": {
         "hue": "#ff8a3d",
         "glyph": "☎",
@@ -69,11 +61,9 @@ _SCAN_ORDER = ["contacts", "procedure", "specs"]
 
 
 def classify_query(query: str) -> str:
-    """Map a query to a spectral category key. Safety always wins."""
+    """Map a query to a spectral category key."""
     if not query or not query.strip():
         return "general"
-    if detect_safety_topic(query):
-        return "safety"
     haystack = query.lower()
     for category in _SCAN_ORDER:
         if any(trigger in haystack for trigger in SPECTRUM[category]["triggers"]):
@@ -107,19 +97,11 @@ _ACRONYMS: list[str] = [
     "SAXS", "WAXS", "PDF", "XRD", "XRF", "XANES", "EXAFS",
 ]
 
-_SAFETY_VOCAB = sorted(
-    {word for words in _SAFETY_WORDS.values() for word in words}, key=len, reverse=True
-)
-
 _BASE_TOKEN = (
     r"(?P<cite>\[Source:[^\]]*\])"
     r"|(?P<phone>(?:ext\.?\s*)?\b\d{3,4}(?:[-\s]?\d{3,4})*\b)"
     + (r"|(?P<acr>\b(?:" + "|".join(map(re.escape, _ACRONYMS)) + r")\b)" if _ACRONYMS else "")
 )
-_SAFETY_ALT = r"|(?P<safety>(?<!\w)(?:" + "|".join(map(re.escape, _SAFETY_VOCAB)) + r")(?!\w))"
-
-_TOKEN_RE = re.compile(_BASE_TOKEN, re.IGNORECASE)
-_TOKEN_RE_SAFETY = re.compile(_BASE_TOKEN + _SAFETY_ALT, re.IGNORECASE)
 
 
 def _wrap(match: "re.Match[str]") -> str:
@@ -151,6 +133,4 @@ def decorate(text: str, category: str, query: str = "") -> str:
     terms = _hit_terms(query)
     if terms:
         parts += r"|(?P<hit>\b(?:" + "|".join(map(re.escape, terms)) + r")\b)"
-    if category == "safety":
-        parts += _SAFETY_ALT
     return re.compile(parts, re.IGNORECASE).sub(_wrap, safe)

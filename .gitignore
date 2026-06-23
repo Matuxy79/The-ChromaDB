@@ -10,6 +10,12 @@ __pycache__/
 # Too large for git (chroma.sqlite3 exceeds the 100 MB GHE limit).
 chroma_store/
 
+# Generated multi-discipline test corpus — ~600 MB of synthetic fixtures, far
+# too large for git. Regenerate with: python scripts/generate_test_corpus.py
+# (the README is kept tracked so the layout is documented in the repo.)
+data/corpus/*
+!data/corpus/README.md
+
 # Streamlit secrets
 .streamlit/secrets.toml
 

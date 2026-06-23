@@ -44,9 +44,19 @@ say "Preparing launch from $ROOT_DIR"
 load_env
 ensure_venv
 ensure_requirements
-say "The Ask Lane parrot uses the local model at ${CLS_PARROT_URL:-http://localhost:11434/v1} (${CLS_PARROT_MODEL:-qwen2.5:0.5b}). Start Ollama first: ollama serve"
+if [ "${CLS_RETRIEVAL_ONLY:-1}" = "0" ] || [ "${CLS_RETRIEVAL_ONLY:-1}" = "false" ]; then
+    say "The Ask Lane parrot uses the local model at ${CLS_PARROT_URL:-http://localhost:11434/v1} (${CLS_PARROT_MODEL:-qwen2.5:0.5b}). Start Ollama first: ollama serve"
+else
+    say "Retrieval-only mode active. The Ask Lane parrot is disabled."
+fi
 
 URL="http://localhost:$PORT"
+
+if [ "${LAUNCHER_DRY_RUN:-0}" = "1" ]; then
+    say "Dry run complete. Chainlit Ask Lane would launch at $URL"
+    exit 0
+fi
+
 say "Launching Chainlit Ask Lane at $URL"
 command -v xdg-open >/dev/null 2>&1 && xdg-open "$URL" >/dev/null 2>&1 &
 

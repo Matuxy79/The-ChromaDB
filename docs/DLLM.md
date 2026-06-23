@@ -6,6 +6,8 @@
 
 Artifact cleanup (PDF hyphenation breaks, stray spacing, duplicate sentences) is handled first by deterministic code (`clean_sentences` in `cls_backend/pipeline.py`).
 
+> Temporary fast mode: `CLS_RETRIEVAL_ONLY=1` is the default right now. In that mode all carrier synthesis, cleanup, self-debate, parrot phrasing, and proxy endpoints are disabled even if a carrier key is configured.
+
 The **inference carrier** — OpenRouter + `openai/gpt-oss-120b` by default — can synthesize a direct answer from the retrieved evidence rows when a key is present. The secondary **cleanup** checkbox is downstream, off by default, and API-only:
 
 - The launcher never starts Ollama.
@@ -16,6 +18,8 @@ The **inference carrier** — OpenRouter + `openai/gpt-oss-120b` by default — 
 ## Configuration
 
 ```bash
+export CLS_RETRIEVAL_ONLY=0
+export CLS_KEYWORD_ONLY=0
 export CLS_DLLM_API_KEY="sk-or-..."
 # export CLS_DLLM_API_URL="https://openrouter.ai/api/v1"
 # export CLS_DLLM_MODEL="openai/gpt-oss-120b"
@@ -28,12 +32,12 @@ export CLS_DLLM_API_KEY="sk-or-..."
 ```text
 question
   -> query repair (strip NL scaffolding)
-  -> all-MiniLM-L6-v2 (local, semantic)
-  -> CAG Layer reuse or hybrid retrieval (semantic + lexical) over ChromaDB
+  -> keyword-only retrieval when CLS_KEYWORD_ONLY=1
+  -> otherwise all-MiniLM-L6-v2 + CAG + hybrid semantic/lexical retrieval
   -> deterministic clean parse
   -> instant answer shown immediately
-  -> optional carrier synthesis from evidence rows (Full App)
-  -> optional carrier cleanup if toggled on and the gate fires
+  -> optional carrier synthesis only when CLS_RETRIEVAL_ONLY=0
+  -> optional carrier cleanup only when CLS_RETRIEVAL_ONLY=0
 ```
 
 | # | System | Where |

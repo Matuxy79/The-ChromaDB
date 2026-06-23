@@ -7,13 +7,17 @@ import chromadb
 from cls_backend.cag_cache import SemanticEvidenceCache
 from cls_backend.pipeline import (
     EMBED_DIM,
+    PARTIAL_MATCH_MIN_LEN,
     EmbeddingUnavailableError,
-    OllamaEmbedder,
     build_extractive_answer,
     clean_sentence,
     clean_sentences,
+    expand_query_terms,
     instant_answer,
+    lexical_retrieve,
+    partial_overlap,
     retrieve,
+    warm_lexical_index,
 )
 
 
@@ -96,6 +100,19 @@ class RetrieveAndInstantAnswerTests(unittest.TestCase):
     def test_retrieve_empty_collection(self):
         self.assertEqual(retrieve(fresh_collection(), self.embedder, "anything"), [])
 
+    def test_lexical_retrieve_reuses_warmed_snapshot_and_respects_filters(self):
+        self.assertEqual(warm_lexical_index(self.collection), 2)
+
+        rows = lexical_retrieve(
+            self.collection,
+            "control room",
+            n_results=2,
+            metadata_filter={"section": "Contacts"},
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertIn("3570", rows[0]["document"])
+
     def test_instant_answer_uses_lexical_fallback_when_embedder_is_offline(self):
         result = instant_answer(
             "control room phone number",
@@ -110,6 +127,22 @@ class RetrieveAndInstantAnswerTests(unittest.TestCase):
         self.assertTrue(result["rows"])
         self.assertIn("3570", result["rows"][0]["document"])
         self.assertTrue(result["answer"])
+
+    def test_instant_answer_keyword_only_skips_embedding(self):
+        result = instant_answer(
+            "control room phone number",
+            collection=self.collection,
+            cache=make_cache(),
+            embedder=OfflineEmbedder(),
+            top_k=2,
+            cache_enabled=True,
+            keyword_only=True,
+        )
+
+        self.assertEqual(result["retrieval_mode"], "keyword_only")
+        self.assertFalse(result["from_cache"])
+        self.assertTrue(result["rows"])
+        self.assertIn("3570", result["rows"][0]["document"])
 
     def test_instant_answer_fresh_then_cached(self):
         cache = make_cache()
@@ -153,6 +186,82 @@ class RetrieveAndInstantAnswerTests(unittest.TestCase):
         self.assertTrue(answer)
         self.assertIn("[Source: manual.pdf, page 7]", answer[0])
         self.assertNotIn("[Source: manual.pdf, page 4]", answer[0])
+
+
+class PartialKeywordMatchTests(unittest.TestCase):
+    """Keyword retrieval matches partial words / arbitrary fragments, not just whole tokens."""
+
+    def setUp(self):
+        self.embedder = TestEmbedder()
+        self.collection = fresh_collection()
+        docs = [
+            doc("gene_table.csv", "Page 1", 1,
+                "Header: gene | organism | chromosome\nRow: SOD7 | H. sapiens | 12"),
+            doc("notes.txt", "Mitochondria", 3,
+                "The mitochondrial membrane regulates osmoregulation near the chromosome."),
+            doc("quantum.md", "QM", 5,
+                "The wavefunction collapses into an eigenstate upon measurement."),
+        ]
+        metas = [
+            {"source": "gene_table.csv", "source_hash": "b1", "page": 1, "domain": "biology", "chunk_index": 0},
+            {"source": "notes.txt", "source_hash": "b2", "page": 3, "domain": "biology", "chunk_index": 0},
+            {"source": "quantum.md", "source_hash": "p1", "page": 5, "domain": "physics", "chunk_index": 0},
+        ]
+        self.collection.add(
+            ids=["b1:0", "b2:0", "p1:0"],
+            documents=docs,
+            metadatas=metas,
+            embeddings=self.embedder.embed(docs),
+        )
+
+    def _sources(self, rows):
+        return {row["metadata"].get("source") for row in rows}
+
+    def test_partial_fragment_retrieves_full_word(self):
+        # "sapi" is not a whole token in any document, yet it must find "sapiens".
+        rows = lexical_retrieve(self.collection, "sapi", n_results=8)
+        self.assertEqual(self._sources(rows), {"gene_table.csv"})
+
+    def test_partial_fragment_surfaces_in_answer(self):
+        rows = lexical_retrieve(self.collection, "chro", n_results=8)
+        answer = build_extractive_answer("chro", rows)
+        self.assertTrue(answer)
+        self.assertTrue(any("chromosome" in sentence.lower() for sentence in answer))
+
+    def test_partial_match_respects_scope_filter(self):
+        # "sapien" lives only in the biology doc; filtering to physics yields nothing.
+        self.assertEqual(
+            lexical_retrieve(self.collection, "sapien", n_results=8, metadata_filter={"domain": "physics"}),
+            [],
+        )
+        rows = lexical_retrieve(self.collection, "sapien", n_results=8, metadata_filter={"domain": "biology"})
+        self.assertEqual(self._sources(rows), {"gene_table.csv"})
+
+    def test_gibberish_returns_nothing(self):
+        self.assertEqual(lexical_retrieve(self.collection, "zxqvw", n_results=8), [])
+
+    def test_short_fragment_falls_back_to_exact(self):
+        # Below the partial-match floor, fragments must not match by substring.
+        self.assertLess(2, PARTIAL_MATCH_MIN_LEN + 1)
+        vocab = frozenset({"chromosome", "eigenstate"})
+        expanded = expand_query_terms({"ch"}, vocab)
+        self.assertEqual(expanded["ch"], set())  # "ch" too short -> no substring expansion
+
+    def test_partial_overlap_counts_fragments(self):
+        self.assertEqual(partial_overlap({"sapi"}, {"sapiens", "organism"}), 1)
+        self.assertEqual(partial_overlap({"chro", "quan"}, {"chromosome", "quantum", "biology"}), 2)
+
+    def test_no_reverse_direction_match(self):
+        # A long, specific query must NOT match short indexed fragments it merely contains
+        # (the over-reach that made "metabolism" pull in unrelated literature chunks).
+        self.assertEqual(partial_overlap({"metabolism"}, {"meta", "bol", "ism", "tab"}), 0)
+        self.assertEqual(partial_overlap({"metabolism"}, {"metabolism", "metabolisms"}), 2)
+        expanded = expand_query_terms({"metabolism"}, frozenset({"meta", "metabolism", "metabolisms"}))
+        self.assertEqual(expanded["metabolism"], {"metabolism", "metabolisms"})
+
+    def test_full_word_query_does_not_match_unrelated_docs(self):
+        # "metabolism" appears in none of the setUp docs -> nothing comes back.
+        self.assertEqual(lexical_retrieve(self.collection, "metabolism", n_results=8), [])
 
 
 if __name__ == "__main__":
