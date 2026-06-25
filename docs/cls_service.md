@@ -109,7 +109,7 @@ def evaluate_retrieval() -> list[dict]
 def warm_keyword_index() -> int
 ```
 
-- `service_status()` returns counts, document breakdown, and carrier status for the Full App sidebar.
+- `service_status()` returns counts, document breakdown, and carrier status for the Full App workspace controls.
 - `dllm_status()` probes the configured OpenAI-compatible carrier at `/models`.
 - `parrot_status()` probes the local parrot endpoint (Ollama/llama.cpp).
 - `evidence_breakdown()` groups indexed chunks by source and reports page spans.

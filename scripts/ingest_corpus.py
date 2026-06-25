@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Ingest the discipline-organised test corpus into the Evidence Store.
+"""Ingest the beamline-organised corpus into the Evidence Store.
 
-Walks <root>/<discipline>/ and indexes every supported file, tagging each chunk
-with `domain=<discipline>` so the Research Scope filter in the UI
+Walks <root>/<beamline_slug>/ and indexes every supported file, tagging each
+chunk with `domain=<beamline_slug>` so the Research Scope filter in the UI
 (cls_config.RESEARCH_SCOPES) returns the right slice. The folder name *is* the
-domain key — chemistry, computer_science, biology, physics, mathematics,
-literature — so there is no per-file metadata to maintain.
+beamline slug from the shared scope map — for example `bmit`, `cmcf`,
+`reixs`, `vespers` — so there is no per-file metadata to maintain.
 
-This is the multi-domain counterpart to the app's single-domain "Index default
-documents" button: one pass, six domains, correct tags.
+This is the multi-beamline counterpart to the app's corpus-admin flow: one
+pass across every populated beamline folder with the correct tags.
 
 Usage
 -----
     python scripts/ingest_corpus.py                       # index data/corpus
-    python scripts/ingest_corpus.py --root data/corpus --only physics
+    python scripts/ingest_corpus.py --root data/corpus --only bmit cmcf
     python scripts/ingest_corpus.py --force               # re-embed everything
     python scripts/ingest_corpus.py --dry-run             # list, don't index
 """
@@ -56,13 +56,13 @@ class HashEmbedder:
             rows.append((tiled / norm).tolist())
         return rows
 
-# Valid domain keys advertised by the UI's Research Scope filter.
+# Valid beamline slugs advertised by the UI's Research Scope filter.
 VALID_DOMAINS = {
     scope["domain"] for scope in RESEARCH_SCOPES.values() if scope
 }
 
 
-def discipline_dirs(root: Path, only: list[str] | None) -> list[Path]:
+def scope_dirs(root: Path, only: list[str] | None) -> list[Path]:
     dirs = sorted(p for p in root.iterdir() if p.is_dir())
     if only:
         wanted = set(only)
@@ -74,9 +74,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--root", type=Path, default=ROOT / "data" / "corpus",
-                        help="Corpus root containing one folder per discipline.")
+                        help="Corpus root containing one folder per beamline slug.")
     parser.add_argument("--only", nargs="*", default=None,
-                        help="Limit to these discipline folders.")
+                        help="Limit to these beamline folders.")
     parser.add_argument("--force", action="store_true",
                         help="Re-embed files that are already indexed.")
     parser.add_argument("--no-embed", action="store_true",
@@ -93,13 +93,13 @@ def main() -> None:
 
     if not args.root.exists():
         sys.exit(f"Corpus root not found: {args.root}\n"
-                 f"Generate it first: python scripts/generate_test_corpus.py")
+                 f"Populate it first with beamline folders and documents.")
 
     totals = {"indexed": 0, "skipped": 0, "failed": 0, "chunks": 0}
-    for folder in discipline_dirs(args.root, args.only):
+    for folder in scope_dirs(args.root, args.only):
         domain = folder.name
         if domain not in VALID_DOMAINS:
-            print(f"[warn] {domain!r} is not a known Research Scope domain "
+            print(f"[warn] {domain!r} is not a known beamline scope slug "
                   f"({', '.join(sorted(VALID_DOMAINS))}); tagging it anyway.")
         files = sorted(p for p in folder.iterdir() if p.is_file() and is_supported(p))
         print(f"\n[{domain}] {len(files)} file(s)")

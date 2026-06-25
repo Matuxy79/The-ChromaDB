@@ -1,4 +1,4 @@
-# CLS Synchrotron Research Query — Architecture (v1.2)
+# CLS Synchrotron Research Query — Architecture (1.5v)
 
 ## Visual Architecture Map
 
@@ -187,7 +187,7 @@ flowchart LR
 ## Product Shape
 
 - **Indexing:** semantic sectioning with AutoContext patterns, embedded with `all-MiniLM-L6-v2` (sentence-transformers, offline CPU), stored in ChromaDB.
-- **Research scopes:** metadata-gated retrieval across six disciplines (Chemistry, Computer Science, Biology, Physics, Mathematics, Literature).
+- **Research scopes:** metadata-gated retrieval across named CLS beamlines via the shared `RESEARCH_SCOPES` map; **All beamlines** bypasses the filter.
 - **Query repair:** natural-language scaffolding is stripped before embedding so verbose human phrasing maps to the same vector as the keyword form.
 - **Temporary keyword retrieval:** `CLS_KEYWORD_ONLY=1` skips query embedding and CAG lookup, then ranks by lexical term overlap for fastest deterministic searches.
 - **Hybrid retrieval:** when `CLS_KEYWORD_ONLY=0`, semantic vector search runs alongside a lexical keyword scan; results merge so exact-keyword hits are never lost.
@@ -205,21 +205,11 @@ flowchart LR
 
 Both surfaces share the same retrieval backend. Session state keys are isolated (`lane_*` vs `last_*`) so switching between them is safe. The Ask Lane keeps a conversation history (`lane_messages`) and renders each turn as native chat bubbles with a source-chip row.
 
-## Research Scopes
+## Beamline Scopes
 
-```python
-RESEARCH_SCOPES = {
-    "All disciplines":  None,
-    "Chemistry":        {"domain": "chemistry"},
-    "Computer Science": {"domain": "computer_science"},
-    "Biology":          {"domain": "biology"},
-    "Physics":          {"domain": "physics"},
-    "Mathematics":      {"domain": "mathematics"},
-    "Literature":       {"domain": "literature"},
-}
-```
+`RESEARCH_SCOPES` in `cls_config.py` is the shared beamline map used by Streamlit and Chainlit. `All beamlines` maps to `None` and bypasses the Chroma metadata filter. Every other entry maps a UI beamline label to its stored `domain` slug, for example `BioXAS-Imaging -> bioxas_imaging`, `BMIT — Biomedical Imaging & Therapy -> bmit`, `CMCF — Macromolecular Crystallography -> cmcf`, and `VESPERS -> vespers`.
 
-`None` bypasses the Chroma metadata filter. Any other value is passed as `metadata_filter={"domain": "<value>"}` to the retrieval call. Documents are tagged at upload time with the matching domain string.
+The current map covers BioXAS-Imaging, BioXAS-Spectroscopy, BMIT, BXDS, CLS@APS, CMCF, EIML, Far-IR, HXMA, IDEAS, Mid-IR, QMSC, REIXS, SGM, SM, SXRMB, SyLMAND, VESPERS, and VLS-PGM. Upload and ingest flows tag documents with the matching beamline slug, and retrieval passes it as `metadata_filter={"domain": "<beamline_slug>"}`.
 
 ## Model Roles
 
@@ -291,9 +281,9 @@ Collection names are in `cls_config.py`:
 - `cls_v2_evidence` — indexed evidence chunks (384d, MiniLM).
 - `cls_v2_cag_cache` — cached query-to-evidence rows (384d, MiniLM).
 
-> **Migration note (v1.1 → v1.2):** the encoder changed from a 768d hash to 384d MiniLM, so the collections were renamed `v1` → `v2`. The old `cls_v1_*` collections are no longer queried. Use **Reset Chroma index** in the admin sidebar and re-index to build the v2 store.
+> **Migration note (v1.1 → 1.5v):** the encoder changed from a 768d hash to 384d MiniLM, so the collections were renamed `v1` → `v2`. The old `cls_v1_*` collections are no longer queried. Open **Workspace**, use **Reset Chroma index**, and re-index to build the v2 store.
 >
-> **Migration note (drop `dsrag` tag):** the collections were renamed `cls_v2_dsrag_*` → `cls_v2_*` (the `dsrag` label was dead naming — not the real `dsrag` library). After pulling this change the renamed collections start empty; re-index (admin sidebar **Reset Chroma index**, or `python scripts/ingest_corpus.py`) to populate them. The orphaned `cls_v2_dsrag_*` collections can be dropped from `chroma_store/`.
+> **Migration note (drop `dsrag` tag):** the collections were renamed `cls_v2_dsrag_*` → `cls_v2_*` (the `dsrag` label was dead naming — not the real `dsrag` library). After pulling this change the renamed collections start empty; re-index (**Workspace** -> **Reset Chroma index**, or `python scripts/ingest_corpus.py`) to populate them. The orphaned `cls_v2_dsrag_*` collections can be dropped from `chroma_store/`.
 
 ### Document readers
 

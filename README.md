@@ -1,22 +1,14 @@
-# CLS Synchrotron Research Query — RAG+CAG Prototype (v1.2)
+# CLS Synchrotron Research Query — RAG+CAG Prototype (1.5v)
 
-A multi-domain Retrieval-Augmented and Cache-Augmented Generation (RAG+CAG) system for the Canadian Light Source (CLS), built with Streamlit, FastAPI, and ChromaDB. Supports six research disciplines indexed as separate metadata-gated scopes.
+A Retrieval-Augmented and Cache-Augmented Generation (RAG+CAG) system for the Canadian Light Source (CLS), built with Streamlit, FastAPI, and ChromaDB. Retrieval is gated by CLS beamline metadata so each beamline lane can be queried independently or together.
 
 Temporary fast mode is enabled by default: generation is disabled and queries use deterministic keyword retrieval for millisecond lookups on the prototype corpus. Set `CLS_RETRIEVAL_ONLY=0` and `CLS_KEYWORD_ONLY=0` to restore hybrid semantic retrieval plus optional carrier synthesis.
 
-## Research Domains
+## Beamline Scopes
 
-| Scope | `domain` tag | Who uses it |
-| --- | --- | --- |
-| All disciplines | `None` | cross-domain queries |
-| Chemistry | `chemistry` | chemical analysis, XRF, crystallography |
-| Computer Science | `computer_science` | control software, data pipelines |
-| Biology | `biology` | protein crystallography, imaging |
-| Physics | `physics` | condensed matter, diffraction, optics |
-| Mathematics | `mathematics` | data analysis, modelling |
-| Literature | `literature` | students, general queries |
+The current app is beamline-scoped, not discipline-scoped. Uploaded documents are tagged from the **Assign a beamline** selector, and the same shared scope map drives both the Full App and Ask Lane.
 
-Tag each document at upload time using the **Assign a research domain** selector. The sidebar scope filter gates Chroma retrieval per domain; **All disciplines** bypasses the filter.
+Choose **All beamlines** to bypass the metadata filter and search the full indexed store. The named scopes currently cover BioXAS-Imaging, BioXAS-Spectroscopy, BMIT, BXDS, CLS@APS, CMCF, EIML, Far-IR, HXMA, IDEAS, Mid-IR, QMSC, REIXS, SGM, SM, SXRMB, SyLMAND, VESPERS, and VLS-PGM.
 
 ## Architecture
 
@@ -102,11 +94,11 @@ curl http://127.0.0.1:8010/v1/query \
 
 ## Indexing Documents
 
-- **Admin sidebar**: one-click index of the local literature test corpus (`data/training_corpus/test_books` by default; override with `CLS_DEFAULT_DOCUMENTS_DIR`).
-- **Admin sidebar**: drag-and-drop batch upload of PDF, TXT, MD, DOCX, HTML, CSV, TSV, and JSON with domain tagging.
+- **Workspace -> Corpus admin**: one-click index of the local literature test corpus (`data/training_corpus/test_books` by default; override with `CLS_DEFAULT_DOCUMENTS_DIR`).
+- **Main page upload panel**: drag-and-drop batch upload of PDF, TXT, MD, DOCX, HTML, CSV, TSV, and JSON with beamline tagging.
 - **`ingest_daemon.py`**: optional batch indexer for folder-watch experiments.
 
-> **Upgrading from v1.1?** The encoder changed to 384d MiniLM, so collections were renamed `cls_v2_*`. Hit **Reset Chroma index** in the admin sidebar and re-index once.
+> **Upgrading from v1.1 to 1.5** The encoder changed to 384d MiniLM, so collections were renamed `cls_v2_*`. Open **Workspace**, hit **Reset Chroma index**, and re-index once.
 
 ## Prototype HUD
 

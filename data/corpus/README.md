@@ -1,63 +1,57 @@
-# Test corpus — multi-discipline, multi-format
+# Corpus Layout — Beamline-Scoped, Multi-Format
 
-This is the project's **test file folder area**: a deliberately messy, realistic
-research-facility corpus used to exercise the RAG+CAG pipeline end to end.
-
-It is **synthetic and generated** — not committed to git (~600 MB; see the root
-`.gitignore`). Only this README is tracked. Regenerate the files locally.
+This folder tracks the beamline-organized corpus layout used by the app. It is
+not the older six-discipline demo. Subdirectories match the `domain` slugs in
+`cls_config.RESEARCH_SCOPES`, and they can be populated incrementally as CLS
+material arrives.
 
 ## Layout
 
-One folder per research discipline. The folder name **is** the `domain`
-metadata key used by the Research Scope filter in the UI
-(`cls_config.RESEARCH_SCOPES`):
+One folder per beamline slug. Empty folders are normal between ingestion
+cycles; this corpus grows episodically as beamline material is added.
 
-```
+```text
 data/corpus/
-  chemistry/         ~100 MB · 5 files
-  computer_science/  ~100 MB · 5 files
-  biology/           ~100 MB · 5 files
-  physics/           ~100 MB · 5 files
-  mathematics/       ~100 MB · 5 files
-  literature/        ~100 MB · 5 files
+  bioxas_imaging/
+  bioxas_spectroscopy/
+  bmit/
+  bxds/
+  cls_aps/
+  cmcf/
+  eiml/
+  far_ir/
+  hxma/
+  ideas/
+  mid_ir/
+  qmsc/
+  reixs/
+  sgm/
+  sm/
+  sxrmb/
+  sylmand/
+  vespers/
+  vls_pgm/
 ```
+
+The checked-in `all/` folder is currently just an empty placeholder; it is not
+one of the named beamline scopes in `RESEARCH_SCOPES`.
 
 ## Format mix
 
-Each discipline holds 5 files, and the formats are spread so the corpus as a
-whole exercises **every reader** in `cls_backend/readers.py`
-(`.pdf .docx .txt .md .html .csv .tsv .json`). Data-heavy formats (txt/md/html/
-csv/tsv/json) carry most of the bytes — the "raw data dumps" — while `.pdf` and
-`.docx` stay paper-sized, matching how real facilities accumulate documents.
-
-Content is topic-coherent per discipline (its own term bank and sentence
-templates), so per-domain retrieval returns sensible, on-topic evidence.
-
-## Regenerate
-
-```bash
-python scripts/generate_test_corpus.py                # full ~600 MB build
-python scripts/generate_test_corpus.py --scale 0.05   # ~30 MB smoke build
-python scripts/generate_test_corpus.py --only physics chemistry
-```
-
-Generation is seeded (`--seed`, default 1729), so a given seed reproduces the
-same corpus.
+Beamline folders can contain any of the formats supported by
+`cls_backend/readers.py` (`.pdf .docx .txt .md .html .csv .tsv .json`). Files
+arrive episodically, so some beamlines may be sparse while others hold manuals,
+runbooks, notes, or data exports.
 
 ## Index it
 
-`scripts/ingest_corpus.py` walks each discipline folder and tags every chunk
-with the correct `domain`, so the Research Scope radio buttons filter correctly:
+`scripts/ingest_corpus.py` walks each beamline folder and tags every chunk with
+that folder slug as `domain`, which is the metadata key used by retrieval:
 
 ```bash
-python scripts/ingest_corpus.py            # index everything in data/corpus
-python scripts/ingest_corpus.py --only biology
-python scripts/ingest_corpus.py --dry-run  # preview without touching the store
+python scripts/ingest_corpus.py                # index everything in data/corpus
+python scripts/ingest_corpus.py --only bmit cmcf
+python scripts/ingest_corpus.py --dry-run      # preview without touching the store
 ```
 
-> Note: the full ~600 MB corpus is a heavy embedding load on CPU. For a quick
-> demo, generate at `--scale 0.05` or ingest a single discipline with `--only`.
-
-The real, git-tracked fixtures (the IVU beamline manual and the Project
-Gutenberg literature set) still live under `data/training_corpus/` and remain
-the app's default one-click corpus.
+The default one-click admin corpus still lives under `data/training_corpus/`.

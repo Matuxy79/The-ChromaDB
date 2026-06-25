@@ -1,6 +1,6 @@
 # CLS Synchrotron Research Query — User Guide
 
-A walkthrough for the v1.2 prototype. The current default is temporary fast mode: deterministic retrieval only, keyword-first, with LLM augmentation disabled.
+A walkthrough for the 1.5v prototype. The current default is temporary fast mode: deterministic retrieval only, keyword-first, with LLM augmentation disabled.
 
 ---
 
@@ -34,7 +34,7 @@ export CLS_DLLM_API_KEY="sk-or-..."
 # export CLS_DLLM_API_URL="http://localhost:8080/v1"
 ```
 
-### Endpoint Status (Full App sidebar)
+### Endpoint Status (Full App)
 
 | State | Meaning |
 | --- | --- |
@@ -59,11 +59,11 @@ Use **🧹 Clear chat** to reset the conversation, or **← Home** to return to 
 
 ## 3. Index Documents
 
-In the Full App sidebar:
+In the Full App workspace:
 
-1. Admins can click **Index default documents** to index the local literature test corpus (`data/training_corpus/test_books` by default).
-2. Admins can drag-and-drop PDF, TXT, MD, DOCX, HTML, CSV, TSV, and JSON files.
-3. Assign a **beamline** from the selector before clicking **Index uploaded files**.
+1. Open **Workspace** and use **Corpus admin** to click **Index default documents** for the local literature test corpus (`data/training_corpus/test_books` by default).
+2. Use the full-width **Upload & index documents** panel to drag-and-drop PDF, TXT, MD, DOCX, HTML, CSV, TSV, and JSON files.
+3. Assign a **beamline** in that upload panel before clicking **Index uploaded files**.
 
 The upload writes to the same ChromaDB Evidence Store used by the query UI and the API.
 
@@ -83,7 +83,7 @@ In temporary fast mode the system:
 
 When `CLS_KEYWORD_ONLY=0`, the system restores the semantic path: MiniLM embedding, CAG cache lookup, and hybrid semantic+lexical retrieval. When `CLS_RETRIEVAL_ONLY=0`, the Full App can synthesize a direct answer from the same evidence rows.
 
-The **Research scope** selector (sidebar) narrows retrieval to a single domain. Set it to **All disciplines** to search the full corpus.
+The **Research scope** selector (sidebar) narrows retrieval to a single CLS beamline. Set it to **All beamlines** to search the full corpus.
 
 For fastest lookup, use content words or exact keywords from the documents. Set `CLS_KEYWORD_ONLY=0` when you want paraphrase-heavy natural language queries.
 
@@ -109,7 +109,7 @@ The inference carrier is blocked in retrieval-only mode, so it cannot slow down 
 | Symptom | Fix |
 | --- | --- |
 | Inference carrier disabled | This is expected with `CLS_RETRIEVAL_ONLY=1`; set it to `0` only when testing generation |
-| No indexed chunks found | Index documents from the sidebar or run `ingest_daemon.py` |
+| No indexed chunks found | Index documents from **Workspace** or run `ingest_daemon.py` |
 | API bridge unavailable | Run `./scripts/launch_api.sh`, relaunch with `CLS_USE_API=1` |
 | Answer is wrong or thin | Open **Retrieval evidence** and check whether the right text was indexed |
 | Streamlit traceback | Re-run the launcher; it refreshes requirements when they drift |

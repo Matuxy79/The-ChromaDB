@@ -1336,100 +1336,104 @@ with st.sidebar:
     selected_scope = st.selectbox("Active scope", list(RESEARCH_SCOPES.keys()), label_visibility="collapsed")
     active_mfilter = RESEARCH_SCOPES[selected_scope]
 
-    st.header("Relevance Audit")
+    st.divider()
+    if st.button("← Home", use_container_width=True):
+        st.session_state.clear()
+        st.rerun()
+
+with st.expander("Search controls", expanded=False):
+    st.caption("Tune retrieval and cache behavior without crowding the ask/search workspace.")
     if RETRIEVAL_ONLY:
-        st.caption("Disabled in retrieval-only mode; no carrier calls are made.")
+        st.caption("Evidence refinement is disabled in retrieval-only mode; no carrier calls are made.")
         debate_enabled = False
         st.toggle("Enable evidence refinement", value=False, disabled=True)
     else:
         st.caption("Second-pass filtering for noisy retrieval sets before synthesis.")
         debate_enabled = st.toggle("Enable evidence refinement", value=False)
 
-    if role_can("index"):
-        _render_corpus_admin()
-
-    # Read-only corpus visibility for every operating tier; the bare User path
-    # stays a pure ask-and-read surface, so it sees no store internals.
-    if active_role != "User":
-        st.header("Evidence Store")
-        store_rows = evidence_breakdown(get_collection())
-        st.metric("Indexed chunks", collection_count(get_collection()))
-        if store_rows:
-            st.caption(f"across {len(store_rows)} document(s)")
-        if role_can("reset") and st.button("Reset Chroma index", use_container_width=True):
-            reset_collection()
-            st.success("Evidence Store reset (CAG cache cleared too). Re-index to query again.")
-
     if role_can("cag_tune"):
-        st.header("♻ CAG Layer")
-        st.caption("Semantic cache of prior question → retrieved evidence.")
-        cag_enabled = st.toggle("Reuse cached evidence", value=True)
-        min_similarity = st.slider("Min similarity for a cache hit", 0.80, 1.00, 0.80, 0.01)
-        st.metric("Cached queries", get_cache().count())
-        if st.button("Clear answer cache", use_container_width=True):
-            get_cache().clear()
-            st.success("CAG cache cleared.")
+        cache_left, cache_right = st.columns([1.15, 0.85], gap="large")
+        with cache_left:
+            st.subheader("♻ CAG Layer")
+            st.caption("Semantic cache of prior question → retrieved evidence.")
+            cag_enabled = st.toggle("Reuse cached evidence", value=True)
+            min_similarity = st.slider("Min similarity for a cache hit", 0.80, 1.00, 0.80, 0.01)
+        with cache_right:
+            st.metric("Cached queries", get_cache().count())
+            if st.button("Clear answer cache", use_container_width=True):
+                get_cache().clear()
+                st.success("CAG cache cleared.")
 
-    get_cache().distance_max = 1.0 - min_similarity
+get_cache().distance_max = 1.0 - min_similarity
 
-    if role_can("dllm"):
-        carrier_name = dllm_endpoint.get("carrier", "OpenRouter")
-        model_name = display_model_name(DLLM_MODEL)
-        st.header("💬 Inference carrier")
-        if RETRIEVAL_ONLY:
-            st.caption(dllm_endpoint.get("detail", "Carrier offline — retrieval evidence and extraction still work."))
-            st.caption("Set `CLS_RETRIEVAL_ONLY=0` before launch to re-enable generation.")
-        else:
-            st.caption(
-                f"{carrier_name} · {DLLM_MODEL}. The carrier writes the optional synthesis only; "
-                "document names, pages, and evidence rows always come from Chroma retrieval."
-            )
-            # Single on/off for carrier synthesis — the generative RAG path, ON by default once the
-            # carrier is ready (key present + reachable).
-            synth_enabled = st.toggle(
-                f"Synthesize answer with {model_name}",
-                value=dllm_api_online,
-                disabled=not dllm_api_online,
-                help="Reads the question + retrieval evidence and writes a direct answer. Off falls "
-                     "back to deterministic extraction.",
-            )
-            # Carrier scope: Grounded (default) keeps the strict trust contract — answer only from the
-            # indexed documents, else refuse. Hybrid lets the carrier also answer general / natural-
-            # language questions from its own knowledge when the documents don't cover them.
-            answer_mode = st.radio(
-                "Answer mode",
-                ["Grounded", "Hybrid"],
-                horizontal=True,
-                disabled=not (dllm_api_online and synth_enabled),
-                help="Grounded · answers strictly from the indexed documents (refuses otherwise). "
-                     "Hybrid · also answers general questions from the model's own knowledge.",
-            )
-            st.caption(
-                "**Grounded** answers only from your indexed documents. **Hybrid** also answers "
-                "natural-language / general questions from the model when the documents don't cover them."
-            )
-            # Secondary, optional: let the same carrier also repair PDF extraction artifacts in the
-            # grounded bullets. Off by default; orthogonal to the generative answer above.
-            dllm_enabled = st.checkbox(
-                "Also clean extraction with carrier",
-                value=False,
-                disabled=not dllm_api_online,
-                help="Applies a guarded in-place correction to the extractive bullets (never invents "
-                     "facts). Independent of the generative answer toggle.",
-            )
-            if not dllm_api_online:
+if role_can("index") or active_role != "User" or role_can("dllm"):
+    with st.expander("Workspace", expanded=False):
+        if role_can("index"):
+            _render_corpus_admin()
+            st.divider()
+
+        # Read-only corpus visibility for every operating tier; the bare User path
+        # stays a pure ask-and-read surface, so it sees no store internals.
+        if active_role != "User":
+            st.subheader("Evidence Store")
+            store_rows = evidence_breakdown(get_collection())
+            st.metric("Indexed chunks", collection_count(get_collection()))
+            if store_rows:
+                st.caption(f"across {len(store_rows)} document(s)")
+            if role_can("reset") and st.button("Reset Chroma index", use_container_width=True):
+                reset_collection()
+                st.success("Evidence Store reset (CAG cache cleared too). Re-index to query again.")
+
+        if role_can("dllm"):
+            carrier_name = dllm_endpoint.get("carrier", "OpenRouter")
+            model_name = display_model_name(DLLM_MODEL)
+            st.divider()
+            st.subheader("💬 Inference carrier")
+            if RETRIEVAL_ONLY:
                 st.caption(dllm_endpoint.get("detail", "Carrier offline — retrieval evidence and extraction still work."))
-
-    if not role_can("index") and not role_can("upload"):
-        st.markdown(
-            '<div class="cls-rolelock">📚 Corpus is curated by an administrator.</div>',
-            unsafe_allow_html=True,
-        )
-
-    st.divider()
-    if st.button("← Home", use_container_width=True):
-        st.session_state.clear()
-        st.rerun()
+                st.caption("Set `CLS_RETRIEVAL_ONLY=0` before launch to re-enable generation.")
+            else:
+                st.caption(
+                    f"{carrier_name} · {DLLM_MODEL}. The carrier writes the optional synthesis only; "
+                    "document names, pages, and evidence rows always come from Chroma retrieval."
+                )
+                # Single on/off for carrier synthesis — the generative RAG path, ON by default once the
+                # carrier is ready (key present + reachable).
+                synth_enabled = st.toggle(
+                    f"Synthesize answer with {model_name}",
+                    value=dllm_api_online,
+                    disabled=not dllm_api_online,
+                    help="Reads the question + retrieval evidence and writes a direct answer. Off falls "
+                         "back to deterministic extraction.",
+                )
+                # Carrier scope: Grounded (default) keeps the strict trust contract — answer only from the
+                # indexed documents, else refuse. Hybrid lets the carrier also answer general / natural-
+                # language questions from its own knowledge when the documents don't cover them.
+                answer_mode = st.radio(
+                    "Answer mode",
+                    ["Grounded", "Hybrid"],
+                    horizontal=True,
+                    disabled=not (dllm_api_online and synth_enabled),
+                    help="Grounded · answers strictly from the indexed documents (refuses otherwise). "
+                         "Hybrid · also answers general questions from the model's own knowledge.",
+                )
+                st.caption(
+                    "**Grounded** answers only from your indexed documents. **Hybrid** also answers "
+                    "natural-language / general questions from the model when the documents don't cover them."
+                )
+                # Secondary, optional: let the same carrier also repair PDF extraction artifacts in the
+                # grounded bullets. Off by default; orthogonal to the generative answer above.
+                dllm_enabled = st.checkbox(
+                    "Also clean extraction with carrier",
+                    value=False,
+                    disabled=not dllm_api_online,
+                    help="Applies a guarded in-place correction to the extractive bullets (never invents "
+                         "facts). Independent of the generative answer toggle.",
+                )
+                if not dllm_api_online:
+                    st.caption(dllm_endpoint.get("detail", "Carrier offline — retrieval evidence and extraction still work."))
+elif not role_can("index") and not role_can("upload"):
+    st.caption("📚 Corpus is curated by an administrator.")
 
 # Full-width drag-and-drop batch upload — roomy drop target for many files at once,
 # shown above the ask/answer columns for the upload-capable tier (Admin).

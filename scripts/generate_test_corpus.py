@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Generate a large, messy, multi-format test corpus for the CLS RAG+CAG stack.
+"""Generate the legacy synthetic multi-pack test corpus for the CLS RAG+CAG stack.
 
-Six research disciplines, ~100 MB each (5 files per discipline), deliberately
-spread across every reader the pipeline supports (.pdf .docx .txt .md .html .csv
-.tsv .json) so the corpus looks like the real, messy output of a research
-facility rather than a tidy single-format dump.
+This generator predates the current beamline-scoped corpus layout. It builds six
+large synthetic topic packs, ~100 MB each (5 files per pack), deliberately spread
+across every reader the pipeline supports (.pdf .docx .txt .md .html .csv .tsv
+.json) so regression testing can still exercise the ingestion pipeline end to end.
 
-Content is synthetic but topic-coherent: each discipline draws on its own term
-bank and sentence templates, so per-domain retrieval still returns sensible,
+Content is synthetic but topic-coherent: each pack draws on its own term bank and
+sentence templates, so metadata-filtered retrieval still returns sensible,
 on-topic evidence. Generation is seeded and deterministic.
 
 Usage
@@ -17,9 +17,9 @@ Usage
     python scripts/generate_test_corpus.py --only chemistry physics
     python scripts/generate_test_corpus.py --out data/corpus
 
-Each discipline lands in <out>/<discipline>/. Folder names match the `domain`
-metadata keys in cls_config.RESEARCH_SCOPES so scripts/ingest_corpus.py can tag
-each file just from its parent folder.
+Each synthetic pack lands in <out>/<pack_slug>/. Those slugs are retained for
+legacy regression runs and can still be indexed by scripts/ingest_corpus.py,
+but they do not describe the current CLS beamline taxonomy.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ MB = 1024 * 1024
 DEFAULT_OUT = Path(__file__).resolve().parent.parent / "data" / "corpus"
 
 # --------------------------------------------------------------------------- #
-# Discipline content packs
+# Legacy synthetic content packs
 # --------------------------------------------------------------------------- #
 # Each pack supplies a term bank used to fill sentence templates (prose formats)
 # and a tabular schema (columns + a row factory) used for csv/tsv/json.
@@ -246,7 +246,7 @@ PACKS: dict[str, dict] = {
     },
 }
 
-# Per-discipline file plan: (stem, format, target_megabytes). Sizes sum to ~100 MB
+# Per-pack file plan: (stem, format, target_megabytes). Sizes sum to ~100 MB
 # and are arranged so every supported reader appears across the corpus, while
 # pdf/docx stay paper-sized (they are the slow, format-sensitive ones).
 FILE_PLANS: dict[str, list[tuple[str, str, float]]] = {
@@ -501,7 +501,7 @@ def generate(out: Path, only: list[str] | None, scale: float, seed: int) -> None
     grand_total = 0
     for discipline in disciplines:
         if discipline not in PACKS:
-            print(f"  ! unknown discipline {discipline!r} — skipping", file=sys.stderr)
+            print(f"  ! unknown legacy pack {discipline!r} — skipping", file=sys.stderr)
             continue
         pack = PACKS[discipline]
         folder = out / discipline
@@ -516,7 +516,7 @@ def generate(out: Path, only: list[str] | None, scale: float, seed: int) -> None
             size = dest.stat().st_size
             disc_total += size
             print(f"  {dest.name:<38} {fmt:<5} {human(size):>10}")
-        print(f"  {'— discipline total —':<38} {'':5} {human(disc_total):>10}")
+        print(f"  {'— pack total —':<38} {'':5} {human(disc_total):>10}")
         grand_total += disc_total
     print(f"\nTOTAL written: {human(grand_total)} under {out}")
 
@@ -527,7 +527,7 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT,
                         help="Output corpus root (default: data/corpus).")
     parser.add_argument("--only", nargs="*", default=None,
-                        help="Limit to these disciplines (default: all six).")
+                        help="Limit to these legacy synthetic packs (default: all six).")
     parser.add_argument("--scale", type=float, default=1.0,
                         help="Multiply every target size (e.g. 0.05 for a quick smoke build).")
     parser.add_argument("--seed", type=int, default=1729, help="RNG seed for reproducibility.")
