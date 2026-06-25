@@ -523,11 +523,16 @@ def _fallback_tier(result: dict) -> str:
     return "weak" if top_score >= _WEAK_SCORE_THRESHOLD else "general"
 
 
-def _render_turn(message: dict) -> None:
+def _render_turn(message: dict, dllm_online: bool) -> None:
     """Render one stored chat turn: user question + assistant answer with chips."""
     with st.chat_message("user", avatar="🧑‍🔬"):
         st.markdown(message["query"])
     with st.chat_message("assistant", avatar="🔬"):
+        scope_results = message.get("scope_results")
+        if scope_results:
+            for scope, result in scope_results.items():
+                _render_scope_summary(scope, result, dllm_online=dllm_online)
+            return
         chips = _source_chips(message.get("rows", []))
         if chips:
             st.markdown(chips, unsafe_allow_html=True)
@@ -546,6 +551,31 @@ def _render_turn(message: dict) -> None:
             st.markdown(augmentation)
         elif not answer:
             st.markdown("_Nothing relevant found — try rephrasing._")
+
+
+def _render_scope_summary(scope: str, result: dict | None, *, dllm_online: bool) -> None:
+    """Compact per-beamline answer card for multi-scope Ask Lane queries."""
+    with st.container(border=True):
+        st.markdown(
+            f'<strong>{html.escape(scope)}</strong>',
+            unsafe_allow_html=True,
+        )
+        if not result or not result.get("rows"):
+            st.caption("_Nothing relevant found — try rephrasing._")
+            return
+        chips = _source_chips(result["rows"])
+        if chips:
+            st.markdown(chips, unsafe_allow_html=True)
+        if result.get("answer"):
+            for sentence in result["answer"]:
+                clean = sentence.split(" [Source:")[0].strip()
+                st.markdown(f"- {clean}")
+        else:
+            tier = _fallback_tier(result)
+            if tier == "weak":
+                st.caption("_Weak corpus match — no direct passage found._")
+            else:
+                st.caption("_Nothing relevant found — try rephrasing._")
 
 
 def _render_ask_lane() -> None:
@@ -569,9 +599,24 @@ def _render_ask_lane() -> None:
 
     with st.sidebar:
         st.header("Research Scope")
-        st.caption("Filter retrieval to a specific CLS beamline.")
-        selected_scope = st.selectbox("Active scope", list(RESEARCH_SCOPES.keys()), label_visibility="collapsed")
-        active_mfilter = RESEARCH_SCOPES[selected_scope]
+        st.caption("Filter retrieval to one or more CLS beamlines.")
+        selected_scopes = st.multiselect(
+            "Active scopes",
+            list(RESEARCH_SCOPES.keys()),
+            default=["All beamlines"],
+            key="lane_scopes",
+            label_visibility="collapsed",
+        )
+        if not selected_scopes:
+            selected_scopes = ["All beamlines"]
+        effective_scopes = selected_scopes
+        if "All beamlines" in effective_scopes and len(effective_scopes) > 1:
+            # All already covers every lane, so keep only the specific selections for comparison.
+            effective_scopes = [s for s in effective_scopes if s != "All beamlines"]
+            st.caption("ℹ All beamlines covers every lane; querying the selected scopes instead.")
+        scope_filters = [(s, RESEARCH_SCOPES[s]) for s in effective_scopes]
+        single_scope = len(scope_filters) == 1
+        active_mfilter = scope_filters[0][1] if single_scope else None
         st.divider()
         if RETRIEVAL_ONLY:
             st.caption("💬 AI augmentation disabled — retrieval-only mode.")
@@ -597,7 +642,7 @@ def _render_ask_lane() -> None:
         )
     else:
         for message in messages:
-            _render_turn(message)
+            _render_turn(message, dllm_online)
 
     prompt = st.chat_input("Ask a question")
     if prompt and prompt.strip():
@@ -609,83 +654,117 @@ def _render_ask_lane() -> None:
         with st.chat_message("user", avatar="🧑‍🔬"):
             st.markdown(query)
 
-        result = None
-        augmentation: str | None = None
-        aug_label: str | None = None
+        if single_scope:
+            result = None
+            augmentation: str | None = None
+            aug_label: str | None = None
 
-        with st.chat_message("assistant", avatar="🔬"):
-            # ---------------------------------------------------------------- #
-            # Pass 1 — instant RAG/CAG: retrieval + extractive bullets.        #
-            # ---------------------------------------------------------------- #
-            try:
-                result = query_backend(query, 16, True, 0.80, metadata_filter=active_mfilter)
-            except RuntimeError as exc:
-                st.error(str(exc))
+            with st.chat_message("assistant", avatar="🔬"):
+                # ---------------------------------------------------------------- #
+                # Pass 1 — instant RAG/CAG: retrieval + extractive bullets.        #
+                # ---------------------------------------------------------------- #
+                try:
+                    result = query_backend(query, 16, True, 0.80, metadata_filter=active_mfilter)
+                except RuntimeError as exc:
+                    st.error(str(exc))
+
+                if result is not None:
+                    tier = _fallback_tier(result)
+                    chips = _source_chips(result["rows"])
+                    if chips:
+                        st.markdown(chips, unsafe_allow_html=True)
+
+                    if result["answer"]:
+                        for sentence in result["answer"]:
+                            clean = sentence.split(" [Source:")[0].strip()
+                            st.markdown(f"- {clean}")
+
+                    # ---------------------------------------------------------------- #
+                    # Pass 2 — streaming LLM fallback, tier-gated.                    #
+                    #   grounded → also augment with context (score was good)          #
+                    #   weak     → augment with retrieved context, flag as partial     #
+                    #   general  → answer from general knowledge, flag clearly         #
+                    # ---------------------------------------------------------------- #
+                    aug_label = None
+                    if dllm_online:
+                        if tier == "grounded":
+                            aug_label = "💬 AI augmentation · grounded synthesis"
+                            aug_grounded = True
+                        elif tier == "weak":
+                            st.caption("_Weak corpus match — augmenting with available context…_")
+                            aug_label = "💬 AI augmentation · partial context"
+                            aug_grounded = True
+                        else:  # general
+                            st.caption("_Not found in indexed documents — answering from general knowledge…_")
+                            aug_label = "💬 General knowledge answer · not from corpus"
+                            aug_grounded = False
+
+                        st.divider()
+                        st.caption(aug_label)
+                        try:
+                            augmentation = st.write_stream(
+                                stream_generate_answer(
+                                    query, result["rows"], model=DLLM_MODEL, grounded=aug_grounded
+                                )
+                            )
+                        except Exception as exc:
+                            st.caption(f"_Augmentation unavailable: {exc}_")
+                            augmentation = None
+                    elif tier != "grounded":
+                        # DLLM offline and no extractive answer
+                        st.markdown("_Nothing relevant found — try rephrasing._")
 
             if result is not None:
-                tier = _fallback_tier(result)
-                chips = _source_chips(result["rows"])
-                if chips:
-                    st.markdown(chips, unsafe_allow_html=True)
-
-                # ---------------------------------------------------------------- #
-                # Pass 1 — extractive bullets (only when RAG found grounded text). #
-                # ---------------------------------------------------------------- #
-                if result["answer"]:
-                    for sentence in result["answer"]:
-                        clean = sentence.split(" [Source:")[0].strip()
-                        st.markdown(f"- {clean}")
-
-                # ---------------------------------------------------------------- #
-                # Pass 2 — streaming LLM fallback, tier-gated.                    #
-                #   grounded → also augment with context (score was good)          #
-                #   weak     → augment with retrieved context, flag as partial     #
-                #   general  → answer from general knowledge, flag clearly         #
-                # ---------------------------------------------------------------- #
-                aug_label: str | None = None
-                if dllm_online:
-                    if tier == "grounded":
-                        aug_label = "💬 AI augmentation · grounded synthesis"
-                        aug_grounded = True
-                    elif tier == "weak":
-                        st.caption("_Weak corpus match — augmenting with available context…_")
-                        aug_label = "💬 AI augmentation · partial context"
-                        aug_grounded = True
-                    else:  # general
-                        st.caption("_Not found in indexed documents — answering from general knowledge…_")
-                        aug_label = "💬 General knowledge answer · not from corpus"
-                        aug_grounded = False
-
-                    st.divider()
-                    st.caption(aug_label)
+                turn: dict = {
+                    "query": query,
+                    "rows": result["rows"],
+                    "answer": result["answer"],
+                }
+                if augmentation:
+                    turn["augmentation"] = augmentation
+                    if aug_label:
+                        turn["augmentation_label"] = aug_label
+                messages.append(turn)
+                st.session_state["lane_rows"] = result["rows"]
+                st.session_state["lane_from_cache"] = result["from_cache"]
+                st.session_state["hud_turns"] = st.session_state.get("hud_turns", 0) + 1
+                st.rerun()
+        else:
+            # ---------------------------------------------------------------- #
+            # Multi-scope mode — run the same query against each selected lane. #
+            # No LLM pass: comparison cards are for quick beamline triage.      #
+            # ---------------------------------------------------------------- #
+            with st.chat_message("assistant", avatar="🔬"):
+                st.caption(f"Querying {len(scope_filters)} selected scopes…")
+                scope_results: dict[str, dict] = {}
+                any_rows = False
+                for scope, mfilter in scope_filters:
                     try:
-                        augmentation = st.write_stream(
-                            stream_generate_answer(
-                                query, result["rows"], model=DLLM_MODEL, grounded=aug_grounded
-                            )
-                        )
-                    except Exception as exc:
-                        st.caption(f"_Augmentation unavailable: {exc}_")
-                        augmentation = None
-                elif tier != "grounded":
-                    # DLLM offline and no extractive answer
-                    st.markdown("_Nothing relevant found — try rephrasing._")
+                        res = query_backend(query, 16, True, 0.80, metadata_filter=mfilter)
+                    except RuntimeError as exc:
+                        st.error(f"{scope}: {exc}")
+                        res = None
+                    scope_results[scope] = res
+                    if res and res.get("rows"):
+                        any_rows = True
+                    _render_scope_summary(scope, res, dllm_online=dllm_online)
 
-        if result is not None:
-            turn: dict = {
-                "query": query,
-                "rows": result["rows"],
-                "answer": result["answer"],
-            }
-            if augmentation:
-                turn["augmentation"] = augmentation
-                if aug_label:
-                    turn["augmentation_label"] = aug_label
-            messages.append(turn)
-            st.session_state["lane_rows"] = result["rows"]
-            st.session_state["lane_from_cache"] = result["from_cache"]
-            st.session_state["hud_turns"] = st.session_state.get("hud_turns", 0) + 1
-            st.rerun()
+            if scope_results:
+                turn = {
+                    "query": query,
+                    "scope_results": scope_results,
+                }
+                messages.append(turn)
+                first_rows = next(
+                    (r["rows"] for r in scope_results.values() if r and r.get("rows")),
+                    [],
+                )
+                st.session_state["lane_rows"] = first_rows
+                st.session_state["lane_from_cache"] = any(
+                    r.get("from_cache") for r in scope_results.values() if r
+                )
+                st.session_state["hud_turns"] = st.session_state.get("hud_turns", 0) + 1
+                st.rerun()
 
     _render_hud()
 
