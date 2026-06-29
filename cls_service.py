@@ -1,3 +1,37 @@
+"""Service layer — the glue between every frontend and the ``cls_backend`` package.
+
+This module owns all stateful singletons (ChromaDB client, embedding model, CAG
+cache) and exposes a clean function-based API that both the Streamlit UI and the
+FastAPI bridge import from.  Nothing in this file should know about HTTP requests
+or Streamlit session state.
+
+Singleton lifecycle
+-------------------
+All heavy objects (SentenceTransformer model, ChromaDB persistent client,
+Evidence Store collection, CAG cache collection) are initialised lazily on
+first call and then reused for the lifetime of the process.  A single
+``threading.RLock`` serialises initialisation so the Streamlit rerun model
+(which can create concurrent threads) cannot double-initialise them.
+
+Key public functions
+--------------------
+ingest_path(path, ...)      Chunk, embed, and upsert a document into ChromaDB.
+ask_manual(query, ...)      Full RAG+CAG retrieval pipeline — returns evidence rows
+                            and the assembled extractive answer.
+answer_text(result)         Extract the plain-text answer string from an ask_manual result.
+generate_answer(...)        Optional: send the extractive answer to the carrier LLM for
+                            prose clean-up (only when CLS_RETRIEVAL_ONLY=0).
+stream_generate_answer(...) Streaming variant of generate_answer.
+parrot_stream(...)          Stream natural-language rephrasing via the small local parrot
+                            model (used by the Chainlit Ask Lane).
+reset_collection()          Drop and recreate the Evidence Store and CAG cache — also
+                            clears the in-memory lexical index.
+
+The corpus lives under ``data/corpus/`` at runtime but is intentionally ephemeral:
+documents are ingested by ``ingest_daemon.py`` or the Streamlit admin panel and
+are *not* committed to version control.
+"""
+
 from __future__ import annotations
 
 import hashlib

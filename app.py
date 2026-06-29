@@ -1,3 +1,26 @@
+"""Streamlit dual-UI — the browser-facing entry point for the CLS RAG+CAG system.
+
+Two UIs are served from this single file, selected on the landing page:
+
+  Full App  — admin + user roles, corpus admin, file upload, precision controls,
+               graded evaluation, and optional LLM synthesis.  The role tier
+               (Explorer / Analyst / Engineer) only controls *which widgets are
+               visible*; it is not a security boundary.
+
+  Ask Lane  — a fast, minimal chat interface for non-technical users.  No LLM,
+               no engineering telemetry — instant retrievaland cited bullets only.
+
+Both UIs call the same backend via ``cls_service.py``.  All retrieval, ranking,
+CAG cache look-up, and answer assembly happen there and in ``cls_backend/``; this
+file is pure presentation.
+
+Key environment switches (set in ``cls.env`` before launch):
+    CLS_RETRIEVAL_ONLY=1  — disables the generative carrier (default ON).
+    CLS_KEYWORD_ONLY=1    — disables semantic vector search; lexical only (default ON).
+
+Start the app:  ./scripts/launch_cls.sh   (creates .venv, installs deps, opens browser)
+"""
+
 from __future__ import annotations
 
 import html

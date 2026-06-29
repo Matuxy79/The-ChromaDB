@@ -1,3 +1,31 @@
+"""Central configuration — every tuneable constant and environment variable in one place.
+
+All runtime behaviour is controlled through environment variables so the same
+codebase can run in fast prototype mode (defaults) or with a live LLM carrier,
+without touching source code.  Set values in ``cls.env`` (gitignored) before
+launching; the launch scripts source that file automatically.
+
+Key environment variables
+-------------------------
+CLS_RETRIEVAL_ONLY      1 = disable the generative carrier entirely (default: 1)
+CLS_KEYWORD_ONLY        1 = skip vector search, use lexical term overlap only (default: 1)
+CLS_DLLM_API_KEY        API key for the generative carrier (OpenRouter, OpenAI, etc.)
+CLS_DLLM_API_URL        Base URL for the carrier (default: https://openrouter.ai/api/v1)
+CLS_DLLM_MODEL          Model name passed to the carrier (default: openai/gpt-oss-120b)
+CLS_PARROT_URL          Ollama / llama.cpp base URL for the Ask Lane parrot (default: localhost:11434)
+CLS_API_URL             Internal FastAPI bridge URL (default: http://127.0.0.1:8010)
+
+Beamline scopes (RESEARCH_SCOPES)
+----------------------------------
+Each entry maps a human-readable beamline name to a ChromaDB metadata filter dict.
+Passing ``None`` as the filter returns the entire corpus (All beamlines).
+The dict keys (e.g. ``"bioxas_imaging"``) also serve as folder names under
+``data/corpus/`` for batch ingest via ``scripts/ingest_corpus.py``.
+
+To add a new beamline: append one entry to RESEARCH_SCOPES and create the
+corresponding sub-folder under ``data/corpus/``.
+"""
+
 from __future__ import annotations
 
 import os

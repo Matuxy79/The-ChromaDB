@@ -1,3 +1,32 @@
+"""Ingest daemon — a file-watching loop that feeds new documents into ChromaDB.
+
+The corpus is intentionally ephemeral: documents are NOT committed to version
+control.  Instead, this daemon watches an *inbox* directory and processes any
+supported file that appears there, moving it into a *processed* sub-folder when
+done.
+
+Workflow
+--------
+1.  Drop PDF / DOCX / TXT / CSV / JSON files (or any SUPPORTED_SUFFIXES) into
+    the inbox directory (default: ``data/corpus/inbox/``).
+2.  The daemon detects the new file, calls ``ingest_path()`` to chunk, embed,
+    and upsert it into the ChromaDB Evidence Store, then moves it to
+    ``data/corpus/processed/`` so it is not re-indexed on restart.
+3.  An optional sidecar file ``<filename>.metadata.json`` next to the document
+    is read and merged into the ChromaDB chunk metadata (beamline domain, author,
+    date, etc.).
+
+The daemon can also be run in single-shot mode (``--once``) to process whatever
+is already in the inbox and exit — useful for CI ingest pipelines or initial
+corpus population.
+
+Usage
+-----
+    python ingest_daemon.py --inbox data/corpus/inbox --interval 10
+    python ingest_daemon.py --inbox data/corpus/inbox --once
+    ./scripts/launch_indexer.sh   (wraps the above with .venv activation)
+"""
+
 import argparse
 import json
 import shutil

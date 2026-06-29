@@ -1,3 +1,28 @@
+"""Pre-retrieval query normaliser — strips conversational scaffolding before embedding.
+
+When a user types "Can you please tell me about the energy range of the HXMA beamline?"
+only the last eight words carry retrieval signal.  The conversational prefix dilutes the
+vector embedding and lowers the quality of semantic search results.
+
+This module fixes that with two cheap, purely lexical passes — no LLM required:
+
+    1.  Filler-prefix stripping  — removes opener phrases like "can you tell me",
+        "I was wondering about", "please explain", "how do I...", etc.
+    2.  Filler-word removal      — drops hedges like "basically", "literally",
+        "kind of", "just", "um", etc.
+
+Facility-specific extensions
+-----------------------------
+Add domain acronym expansions or common typo corrections to the two lists near
+the bottom of the file (TYPO_REPLACEMENTS, QUERY_EXPANSIONS).  The structure
+never changes; only the list contents are deployment-specific.
+
+The public entry point is ``repair_query(query) -> dict`` which returns a dict
+containing the cleaned search string and a list of human-readable notes about
+what was changed — displayed in the Streamlit Engineer role panel as a
+diagnostic trace.
+"""
+
 import re
 from typing import Any, Dict, List, Tuple
 

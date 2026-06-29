@@ -1,3 +1,31 @@
+"""FastAPI shared bridge — an *optional* HTTP layer in front of the RAG+CAG backend.
+
+This API is only active when the environment variable ``CLS_USE_API=1`` is set.
+By default the Streamlit UI (``app.py``) and the Chainlit Ask Lane (``chat_lane.py``)
+import ``cls_service`` directly; no HTTP hop is needed for local single-machine use.
+
+Three route groups are exposed:
+
+    POST /v1/query
+        Structured retrieval request.  Returns grounded evidence rows and the
+        assembled extractive answer.  The schema mirrors OpenAI where sensible
+        so existing tooling can point at this endpoint with minimal changes.
+
+    POST /v1/chat/completions
+        OpenAI-compatible chat endpoint.  Wraps the same retrieval backend so
+        any OpenAI-compatible client (LangChain, LlamaIndex, curl, etc.) can
+        drive the CLS knowledge base without code changes.
+
+    POST /v1/dllm/chat
+        Thin proxy to the configured generative carrier (OpenRouter by default,
+        Ollama for offline use).  Only reachable when ``CLS_RETRIEVAL_ONLY=0``.
+
+CORS is restricted to localhost origins; no external traffic is expected in the
+current prototype deployment.
+
+Start standalone:  ./scripts/launch_api.sh
+"""
+
 from __future__ import annotations
 
 import time
