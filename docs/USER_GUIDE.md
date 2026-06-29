@@ -1,130 +1,117 @@
-# CLS RAG+CAG — Scientist Guide
+# CLS Synchrotron Research Query — User Guide
 
-A short, opinionated walkthrough for using the chatbot. Read once; then keep the app open.
+A walkthrough for the 1.5v prototype. The current default is temporary fast mode: deterministic retrieval only, keyword-first, with LLM augmentation disabled.
 
 ---
 
-## 1. Start the app
+## 1. Start The App
 
 ```bash
-./launch_cls.sh
+./scripts/launch_cls.sh
 ```
 
-The launcher creates `.venv` on first run, installs Python packages, starts Ollama if it is installed but not running, and opens the chat UI on `http://localhost:8501`.
+Creates `.venv` on first run, installs packages, and opens the UI at `http://localhost:8501`. Does not start Ollama or pull any LLM.
 
-On Linux desktops, double-clicking `CLS_RAG_CAG.desktop` does the same thing.
-
-### Offline pill
-
-Top right of the page shows one of two states:
-
-| Pill                                  | What it means                                                       |
-| ------------------------------------- | ------------------------------------------------------------------- |
-| 🟢 `Offline-only · Ollama reachable`  | Ollama is responding on `127.0.0.1:11434`. The app is fully local.  |
-| 🔴 `Ollama unreachable`               | The chat input is disabled. Start Ollama and click **Re-check**.    |
-
-The app never makes outbound calls during a chat. If your network is off, the only thing that breaks is the first-time model download — not the running app.
-
----
-
-## 2. Index documents
-
-You have two paths:
-
-### A. Drop files in the sidebar (quick, one-off)
-
-1. Open the **Index maintenance** expander.
-2. Drag PDFs / TXTs onto the uploader.
-3. Pick **Index as lane** (the [Prism lane](#3-prism-lanes) the file belongs to) and **Document domain**.
-4. Click **Index uploaded files**.
-
-You'll see one card per file with four live progress bars:
-
-```
-📄 Extract → ✂️ Chunk → 🧠 Embed → 💾 Store
-```
-
-Each bar updates every few seconds. The final card shows:
-
-```
-✅ IVU manual.pdf
-   108 page(s) · 287 chunk(s) · 51.4 s total · 5.6 chunks/s
-   📄 Extract 3.8 s · ✂️ Chunk 0.1 s · 🧠 Embed 46.9 s · 💾 Store 0.6 s
-```
-
-### B. Drop files in `docs/inbox/` (batch, scriptable)
+Fast mode defaults:
 
 ```bash
-./launch_indexer.sh --lane green --domain beamline
+export CLS_RETRIEVAL_ONLY=1
+export CLS_KEYWORD_ONLY=1
 ```
 
-Processed files move to `docs/processed/`, failures move to `docs/failed/`. Add `--watch --interval 10` to keep polling.
+Set both to `0` before launch to restore hybrid semantic retrieval and carrier synthesis.
 
-Optional per-file metadata via a sidecar JSON named `<file>.metadata.json`:
+### Inference Carrier (optional, Full App only)
 
-```json
-{ "colour_code": "green", "domain": "beamline", "source_url": "IVU beamline manual" }
+The carrier is any OpenAI-compatible endpoint. OpenRouter + `openai/gpt-oss-120b` is the default. It is ignored while `CLS_RETRIEVAL_ONLY=1`. To test generation again:
+
+```bash
+export CLS_RETRIEVAL_ONLY=0
+export CLS_KEYWORD_ONLY=0
+# Cloud (OpenRouter)
+export CLS_DLLM_API_KEY="sk-or-..."
+# Local llama.cpp (no key):  llama-server -m model.gguf --port 8080
+# export CLS_DLLM_API_URL="http://localhost:8080/v1"
 ```
 
----
+### Endpoint Status (Full App)
 
-## 3. Prism lanes
-
-Lanes are stored in chunk metadata and applied at query time. Pick one in the sidebar before asking a question.
-
-| Lane     | Colour | Use it for                                      |
-| -------- | ------ | ----------------------------------------------- |
-| Research | purple | Publications, technical specs                   |
-| Beamline | green  | Energy ranges, hardware, alignment, procedures  |
-| Outreach | blue   | Public-facing info, tours, general facility     |
-| Logistics| orange | User-program policies, administrative procedures|
-| Education| yellow | Student resources, training material            |
-
-Leave it on **None** to search across all lanes. If a lane is set and the app says it doesn't know, the UI shows a small blue card suggesting you try **None**.
+| State | Meaning |
+| --- | --- |
+| `Streamlit -> embedded service` | Local Python service, no API bridge needed |
+| `Streamlit -> FastAPI` | Calling the shared API at `CLS_API_URL` |
+| `Retrieval-only mode active` | Generation, cleanup, parrot phrasing, and carrier proxy calls are blocked |
+| `Inference carrier ... online` | Carrier is reachable; synthesis available when `CLS_RETRIEVAL_ONLY=0` |
+| `Inference carrier ... offline` | RAG/CAG extraction still works; synthesis unavailable |
 
 ---
 
-## 4. Asking a question
+## 2. Choose A UI
 
-Type into the chat box at the bottom. The system uses the embedding model for semantic retrieval, then the small local chat model writes a readable Markdown answer from those retrieved rows.
+The landing page offers two entry points:
 
-Use **Answer mode → Evidence rows** in the sidebar when you want the fastest possible source preview without generated prose.
+- **Full App** — Admin / User roles, corpus upload, evidence rows, precision controls, optional LLM synthesis.
+- **Ask Lane** — Bright chat interface (llama.cui-style). Type in the bottom bar, get a cited answer with source chips; the conversation stacks as chat bubbles. Retrieval-only — no LLM, for instant speed.
 
-Before searching, the app silently repairs a small set of known beamline acronym spacing/typos. `IVU` and `IVW` are treated as distinct beamline concepts. Open the retrieval trace to see the repaired search query.
-
-Three things appear under each answer:
-
-1. **Safety banner** (orange) — only if the question touches a safety topic. Lists emergency numbers and reminds the scientist to confirm procedures with staff. See [SAFETY.md](SAFETY.md).
-2. **Low-confidence card** (yellow) — only if the best retrieval distance is past `0.55`. The answer is still shown, but treat it as a lead.
-3. **Retrieval trace** — collapsible expander labelled `🔍 Retrieval trace — N hit(s) · X ms`. Open it to see source filename, lane, domain, vector distance, and a 120-character preview for each chunk the model used.
-
-The answer citations (`[1]`, `[2]`, etc.) refer to rows in this trace. If the trace looks wrong, the answer is wrong.
+Use **🧹 Clear chat** to reset the conversation, or **← Home** to return to the landing page (both in the Ask Lane sidebar).
 
 ---
 
-## 5. Speed expectations
+## 3. Index Documents
 
-On a typical CLS workstation (CPU-only, `nomic-embed-text` + `llama3.2:1b`):
+In the Full App workspace:
 
-| Action                              | Wall time         |
-| ----------------------------------- | ----------------- |
-| App cold-start                      | 2–4 s             |
-| Indexing 7 MB / 100-page PDF        | 45–75 s           |
-| First question after model load     | 5–15 s            |
-| Subsequent questions                | 2–8 s             |
+1. Open **Workspace** and use **Corpus admin** to click **Index default documents** for the local literature test corpus (`data/training_corpus/test_books` by default).
+2. Use the full-width **Upload & index documents** panel to drag-and-drop PDF, TXT, MD, DOCX, HTML, CSV, TSV, and JSON files.
+3. Assign a **beamline** in that upload panel before clicking **Index uploaded files**.
 
-Embedding is the indexing floor on CPU; chat generation is the answer-time floor. If you want true speedups, run Ollama on GPU or switch to **Evidence rows** mode for retrieval testing.
+The upload writes to the same ChromaDB Evidence Store used by the query UI and the API.
+
+For batch ingestion, `ingest_daemon.py` watches a folder and indexes new files automatically.
+
+---
+
+## 4. Asking A Question
+
+In the **Ask Lane**, type in the bottom chat bar and press enter. In the **Full App**, type a query (or click a suggested-problem chip) and click **Search Documents**.
+
+In temporary fast mode the system:
+
+1. Repairs the query — strips conversational scaffolding ("how do I...", "can you tell me about...") so the meaningful keywords stay prominent.
+2. Runs deterministic keyword retrieval filtered by the selected research scope.
+3. Builds an extractive answer from cited source sentences (shown with source chips in the Ask Lane).
+
+When `CLS_KEYWORD_ONLY=0`, the system restores the semantic path: MiniLM embedding, CAG cache lookup, and hybrid semantic+lexical retrieval. When `CLS_RETRIEVAL_ONLY=0`, the Full App can synthesize a direct answer from the same evidence rows.
+
+The **Research scope** selector (sidebar) narrows retrieval to a single CLS beamline. Set it to **All beamlines** to search the full corpus.
+
+For fastest lookup, use content words or exact keywords from the documents. Set `CLS_KEYWORD_ONLY=0` when you want paraphrase-heavy natural language queries.
+
+---
+
+## 5. Speed Expectations
+
+| Action | Wall time |
+| --- | --- |
+| App cold-start | 2–4 s |
+| Keyword-only query | usually milliseconds on the prototype corpus |
+| First embed call when semantic mode is enabled | a few seconds, once per process |
+| Indexing a 7 MB / 100-page PDF | seconds to tens of seconds |
+| First semantic query after indexing (warm model) | usually under a second |
+| Repeated cached query | near-instant (CAG hit) |
+
+The inference carrier is blocked in retrieval-only mode, so it cannot slow down searches.
 
 ---
 
 ## 6. Troubleshooting
 
-| Symptom                                            | First thing to try                                                                      |
-| -------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| Red offline pill                                   | `ollama serve` in a terminal, then click **Re-check**.                                  |
-| Chat says "I don't know"                           | Switch lane to **None**; the doc may not be in the lane you selected.                   |
-| Indexing bar stuck at "Embed"                      | Confirm `nomic-embed-text` is installed: `ollama list`. If not: `ollama pull nomic-embed-text`. |
-| Answer is confidently wrong                        | Open the retrieval trace. If the sources are unrelated, the doc isn't indexed; add it.  |
-| Streamlit shows a Python traceback                 | Re-run the launcher script; it reinstalls requirements when they drift.                 |
+| Symptom | Fix |
+| --- | --- |
+| Inference carrier disabled | This is expected with `CLS_RETRIEVAL_ONLY=1`; set it to `0` only when testing generation |
+| No indexed chunks found | Index documents from **Workspace** or run `ingest_daemon.py` |
+| API bridge unavailable | Run `./scripts/launch_api.sh`, relaunch with `CLS_USE_API=1` |
+| Answer is wrong or thin | Open **Retrieval evidence** and check whether the right text was indexed |
+| Streamlit traceback | Re-run the launcher; it refreshes requirements when they drift |
 
-For anything else, see [ARCHITECTURE.md](ARCHITECTURE.md) for the technical layout.
+For technical details, see [ARCHITECTURE.md](ARCHITECTURE.md).

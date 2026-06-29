@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=CLS RAG+CAG
+Comment=Launch the CLS RAG+CAG Streamlit prototype
+Exec=bash scripts/launch_cls.sh
+Path=/home/matukuj/Desktop/The ChromaDB
+Terminal=true
+Icon=applications-science
+Categories=Science;

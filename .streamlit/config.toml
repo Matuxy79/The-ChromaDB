@@ -1,0 +1,14 @@
+[server]
+# Bulk document drops: lift Streamlit's default 200 MB ceiling so a large batch
+# of PDFs/TXT/MD can be dragged in at once. Tune down if memory-constrained.
+maxUploadSize = 2000
+maxMessageSize = 2000
+
+# Disable the auto-reload file watcher. It walks every imported module — including
+# HuggingFace transformers, whose lazy vision-model imports need torchvision (which we
+# don't install) and spam the console with harmless ModuleNotFoundError tracebacks.
+# The launcher restarts the app anyway, so live-reload isn't needed here.
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false

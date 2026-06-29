@@ -1,3 +1,32 @@
+"""Ingest daemon — a file-watching loop that feeds new documents into ChromaDB.
+
+The corpus is intentionally ephemeral: documents are NOT committed to version
+control.  Instead, this daemon watches an *inbox* directory and processes any
+supported file that appears there, moving it into a *processed* sub-folder when
+done.
+
+Workflow
+--------
+1.  Drop PDF / DOCX / TXT / CSV / JSON files (or any SUPPORTED_SUFFIXES) into
+    the inbox directory (default: ``data/corpus/inbox/``).
+2.  The daemon detects the new file, calls ``ingest_path()`` to chunk, embed,
+    and upsert it into the ChromaDB Evidence Store, then moves it to
+    ``data/corpus/processed/`` so it is not re-indexed on restart.
+3.  An optional sidecar file ``<filename>.metadata.json`` next to the document
+    is read and merged into the ChromaDB chunk metadata (beamline domain, author,
+    date, etc.).
+
+The daemon can also be run in single-shot mode (``--once``) to process whatever
+is already in the inbox and exit — useful for CI ingest pipelines or initial
+corpus population.
+
+Usage
+-----
+    python ingest_daemon.py --inbox data/corpus/inbox --interval 10
+    python ingest_daemon.py --inbox data/corpus/inbox --once
+    ./scripts/launch_indexer.sh   (wraps the above with .venv activation)
+"""
+
 import argparse
 import json
 import shutil
@@ -5,11 +34,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from examples.cls_ingest import ingest_document
-from examples.cls_kb_setup import build_cls_kb
-
-
-SUPPORTED_SUFFIXES = {".pdf", ".txt"}
+from cls_backend.readers import SUPPORTED_SUFFIXES
+from cls_service import file_signature, ingest_path
 
 
 def load_sidecar_metadata(path: Path) -> dict[str, Any]:
@@ -69,7 +95,7 @@ def iter_documents(inbox: Path) -> list[Path]:
     )
 
 
-def process_document(kb, path: Path, args: argparse.Namespace) -> bool:
+def process_document(path: Path, args: argparse.Namespace) -> bool:
     metadata = {
         "colour_code": args.lane,
         "domain": args.domain,
@@ -78,32 +104,44 @@ def process_document(kb, path: Path, args: argparse.Namespace) -> bool:
     }
     metadata.update(load_sidecar_metadata(path))
 
+    source_hash = file_signature(path)
+
     try:
-        indexed = ingest_document(kb, str(path), metadata)
+        chunks_indexed, status = ingest_path(
+            path, source_hash, extra_metadata=metadata
+        )
     except Exception as exc:
         print(f"[failed] {path.name}: {exc}")
         move_with_sidecars(path, args.failed)
         return False
 
-    if not indexed:
+    if status == "no readable text found":
         print(f"[skipped] {path.name}: no extractable text")
         move_with_sidecars(path, args.failed)
         return False
 
-    print(f"[indexed] {path.name} lane={metadata.get('colour_code')} domain={metadata.get('domain')}")
+    if status == "already indexed":
+        print(f"[skipped] {path.name}: already indexed")
+        move_with_sidecars(path, args.processed)
+        return True
+
+    print(
+        f"[indexed] {path.name} lane={metadata.get('colour_code')} "
+        f"domain={metadata.get('domain')} chunks={chunks_indexed}"
+    )
     move_with_sidecars(path, args.processed)
     return True
 
 
-def run_once(kb, args: argparse.Namespace) -> int:
+def run_once(args: argparse.Namespace) -> int:
     documents = iter_documents(args.inbox)
     if not documents:
-        print(f"[idle] No PDF/TXT files found in {args.inbox}")
+        print(f"[idle] No supported files found in {args.inbox}")
         return 0
 
     count = 0
     for document in documents:
-        if process_document(kb, document, args):
+        if process_document(document, args):
             count += 1
     return count
 
@@ -127,10 +165,8 @@ def main() -> None:
     args.processed.mkdir(parents=True, exist_ok=True)
     args.failed.mkdir(parents=True, exist_ok=True)
 
-    kb = build_cls_kb()
-
     while True:
-        indexed = run_once(kb, args)
+        indexed = run_once(args)
         if not args.watch:
             print(f"[done] Indexed {indexed} document(s).")
             return

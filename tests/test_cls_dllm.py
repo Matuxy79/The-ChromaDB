@@ -1,14 +1,24 @@
 import unittest
 
-from examples.cls_dllm import correction_user, needs_correction, parse_bullets, validate_correction
-from examples.cls_spectrum import decorate
+from cls_backend.dllm import (
+    answer_context,
+    answer_numbers_grounded,
+    answer_user,
+    correction_user,
+    needs_correction,
+    parrot_trustworthy,
+    parse_bullets,
+    relation_drift,
+    validate_correction,
+)
+from cls_backend.spectrum import decorate
 
 
 class GateStaysSparseTests(unittest.TestCase):
     def test_clean_answer_does_not_activate(self):
         clean = [
-            "The Undulator beamline phone is ext. 3832. [Source: IVU manual.pdf, page 4]",
-            "Contact Beatriz Moreno at 306-241-1999. [Source: IVU manual.pdf, page 2]",
+            "The CLS Control Room phone is ext. 3570. [Source: facility_manual.pdf, page 4]",
+            "Contact the floor coordinator at ext. 3639. [Source: facility_manual.pdf, page 2]",
         ]
         activate, reason = needs_correction(clean)
         self.assertFalse(activate)
@@ -80,19 +90,80 @@ class ValidateCorrectionTests(unittest.TestCase):
         self.assertFalse(validate_correction("The phone is ext. 3832. Section 1.1, p. 4", self.SRC))
 
 
+class RelationDriftTests(unittest.TestCase):
+    EVIDENCE = [
+        "The CLS Control Room can be reached at ext. 3570. [Source: m.pdf, page 4]",
+        "For hutch access contact the floor coordinator at ext. 3639. [Source: m.pdf, page 2]",
+    ]
+
+    def test_elevator_drift_is_flagged(self):
+        # Real numbers kept, but 3639 bound to "elevator" which is absent from the evidence.
+        drifted = "The control room is at ext. 3570 and accessed via elevator number 3639 for hutch access."
+        offending = relation_drift(drifted, self.EVIDENCE)
+        self.assertIn("elevator", offending)
+        self.assertFalse(parrot_trustworthy(drifted, self.EVIDENCE))
+
+    def test_faithful_rephrase_is_clean(self):
+        faithful = "The CLS control room is reached at ext. 3570; the floor coordinator handles hutch access at ext. 3639."
+        self.assertEqual(relation_drift(faithful, self.EVIDENCE), [])
+        self.assertTrue(parrot_trustworthy(faithful, self.EVIDENCE))
+
+    def test_word_far_from_number_is_not_scrutinised(self):
+        # "Reach"/"located" sit away from the digits, so general rephrasing is tolerated.
+        rephrased = "Located info: the control room is reached at ext. 3570."
+        self.assertEqual(relation_drift(rephrased, self.EVIDENCE), [])
+
+    def test_invented_number_still_caught_by_number_guard(self):
+        invented = "The control room is at ext. 9999."
+        self.assertFalse(parrot_trustworthy(invented, self.EVIDENCE))
+
+
 class QueryHighlightTests(unittest.TestCase):
     def test_query_terms_become_hits(self):
-        out = decorate("The undulator energy range.", "specs", query="energy range")
+        out = decorate("The synchrotron energy range.", "specs", query="energy range")
         self.assertIn("tok-hit", out)
 
     def test_acronym_beats_query_hit(self):
-        # IVU is in the stoplist AND an acronym -> rendered as acronym, never as a plain hit.
-        out = decorate("The IVU device.", "general", query="ivu device")
+        # SAXS is in _ACRONYMS -> rendered as tok-acr, not as a plain tok-hit.
+        out = decorate("The SAXS experiment.", "specs", query="saxs experiment")
         self.assertIn("tok-acr", out)
 
     def test_stopwords_not_highlighted(self):
         out = decorate("what is the gap", "general", query="what is the")
         self.assertNotIn("tok-hit", out)
+
+
+class GenerativeAnswerTests(unittest.TestCase):
+    ROWS = [
+        {
+            "document": "Source: Great_Expectations.txt\nSection: Great Expectations\nPage: 1\n\n"
+                        "Great Expectations, 1867 Edition, by Charles Dickens. Chapter I.",
+            "metadata": {"source": "Great_Expectations.txt", "page": 1},
+        }
+    ]
+
+    def test_context_is_numbered_and_labelled(self):
+        out = answer_context(self.ROWS)
+        self.assertIn("[1]", out)
+        self.assertIn("Source: Great_Expectations.txt, page 1", out)
+
+    def test_context_strips_chunk_header(self):
+        # The "Source:/Section:/Page:" embedding header must not leak into the prompt body.
+        out = answer_context(self.ROWS)
+        self.assertNotIn("Section: Great Expectations\n", out)
+        self.assertIn("Charles Dickens", out)
+
+    def test_user_prompt_carries_question_and_context(self):
+        out = answer_user("great expectations author", self.ROWS)
+        self.assertIn("Question: great expectations author", out)
+        self.assertIn("Charles Dickens", out)
+
+    def test_grounding_guard_accepts_context_numbers(self):
+        # 1867 appears in the context, so it is grounded.
+        self.assertTrue(answer_numbers_grounded("Published in 1867 by Charles Dickens [1].", self.ROWS))
+
+    def test_grounding_guard_flags_invented_numbers(self):
+        self.assertFalse(answer_numbers_grounded("Reach the author at 306-555-0199 [1].", self.ROWS))
 
 
 if __name__ == "__main__":

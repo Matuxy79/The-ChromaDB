@@ -1,48 +1,23 @@
-# ─── Python ────────────────────────────────────────────────────────────────
+# Local dev secrets — holds the dLLM/LLM API key. Never commit.
+cls.env
+
+# Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-
-# ─── Virtual env ───────────────────────────────────────────────────────────
+*.pyc
 .venv/
-venv/
-env/
 
-# ─── Local indices and binary state ────────────────────────────────────────
-# ChromaDB persistent stores. Names follow `<kb_id>_chroma_db/`.
-*_chroma_db/
+# ChromaDB vector store — regenerable build artifact (rebuild by re-indexing).
+# Too large for git (chroma.sqlite3 exceeds the 100 MB GHE limit).
 chroma_store/
-chroma.sqlite3
-*.parquet
 
-# ─── Logs ──────────────────────────────────────────────────────────────────
-ollama.log
+# Generated multi-discipline test corpus — ~600 MB of synthetic fixtures, far
+# too large for git. Regenerate with: python scripts/generate_test_corpus.py
+# (the README is kept tracked so the layout is documented in the repo.)
+data/corpus/*
+!data/corpus/README.md
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Logs
 *.log
-
-# ─── Document inbox / processed / failed ───────────────────────────────────
-# These hold scientist-uploaded PDFs that should not be redistributed.
-docs/inbox/*
-docs/processed/*
-docs/failed/*
-!docs/inbox/.gitkeep
-!docs/processed/.gitkeep
-!docs/failed/.gitkeep
-
-# ─── Source training corpus (not redistributable) ──────────────────────────
-Training for perfect in ui graded/
-
-# ─── Editor / OS ───────────────────────────────────────────────────────────
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
-*~
-*.swp
-
-# ─── Build artefacts ───────────────────────────────────────────────────────
-dist/
-build/
