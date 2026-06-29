@@ -15,11 +15,23 @@ import html
 import re
 
 
+# ---------------------------------------------------------------------------
+# Palette — the five hues of the visible-light spectrum, red → blue.
+# These are the single source of truth for every colour in the UI: query cards,
+# the DB status badge, HIT/MISS labels, CSS gradients.  Import these constants
+# rather than repeating hex strings anywhere else in the codebase.
+# ---------------------------------------------------------------------------
+HUE_RED    = "#ff4d6d"   # danger · error · rose (leftmost, high energy)
+HUE_ORANGE = "#ff8a3d"   # contacts · --accent
+HUE_AMBER  = "#ffc24b"   # procedure · warning
+HUE_GREEN  = "#6fd58a"   # specs · healthy · cache hit
+HUE_BLUE   = "#6aa9ff"   # general · info (rightmost, low energy)
+
 # Categories in visible-spectrum order.
 # Contacts sits up front because it carries the strongest visual cue.
 SPECTRUM: dict[str, dict] = {
     "contacts": {
-        "hue": "#ff8a3d",
+        "hue": HUE_ORANGE,
         "glyph": "☎",
         "label": "Contacts",
         "triggers": [
@@ -28,7 +40,7 @@ SPECTRUM: dict[str, dict] = {
         ],
     },
     "procedure": {
-        "hue": "#ffc24b",
+        "hue": HUE_AMBER,
         "glyph": "⚙",
         "label": "Procedure",
         "triggers": [
@@ -39,7 +51,7 @@ SPECTRUM: dict[str, dict] = {
         ],
     },
     "specs": {
-        "hue": "#6fd58a",
+        "hue": HUE_GREEN,
         "glyph": "📐",
         "label": "Specs",
         "triggers": [
@@ -50,7 +62,7 @@ SPECTRUM: dict[str, dict] = {
         ],
     },
     "general": {
-        "hue": "#6aa9ff",
+        "hue": HUE_BLUE,
         "glyph": "◇",
         "label": "General",
         "triggers": [],  # fallback

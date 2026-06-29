@@ -19,6 +19,7 @@ cls_backend — this file is only the Chainlit view.
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 
 import chainlit as cl
@@ -77,6 +78,9 @@ async def _astream_parrot(sentences: list[str]):
         yield token
 
 
+_STREAMLIT_URL = os.getenv("CLS_STREAMLIT_URL", "http://localhost:8501")
+
+
 @cl.on_chat_start
 async def start():
     scopes = list(RESEARCH_SCOPES.keys())
@@ -93,7 +97,7 @@ async def start():
                 if RETRIEVAL_ONLY
                 else "The grounded evidence is the source of truth; the phrased answer rides on top."
             )
-        )
+        ),
     ).send()
 
 

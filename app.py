@@ -43,6 +43,7 @@ from cls_config import (
     KEYWORD_ONLY_RETRIEVAL,
     RESEARCH_SCOPES,
     RETRIEVAL_ONLY,
+    add_research_scope,
 )
 from cls_service import (
     ask_manual,
@@ -57,7 +58,9 @@ from cls_service import (
     get_cache,
     get_collection,
     ingest_path,
+    flush_cag_cache,
     reset_collection,
+    store_status,
     uploaded_signature,
     warm_keyword_index,
 )
@@ -70,6 +73,10 @@ from cls_backend.dllm import (
     validate_correction,
 )
 from cls_backend.spectrum import (
+    HUE_AMBER,
+    HUE_GREEN,
+    HUE_ORANGE,
+    HUE_RED,
     category_meta,
     classify_query,
     decorate,
@@ -89,7 +96,7 @@ ROLES: dict[str, dict] = {
         "glyph": "🛡",
         "accent": "#ff4d6d",
         "tagline": "Full control — corpus lifecycle, tuning, and evaluation.",
-        "caps": {"index", "upload", "reindex", "reset", "tune", "cag_tune", "dllm", "eval"},
+        "caps": {"index", "upload", "reindex", "reset", "tune", "cag_tune", "dllm", "eval", "scopes"},
     },
     "User": {
         "glyph": "👤",
@@ -99,6 +106,12 @@ ROLES: dict[str, dict] = {
     },
 }
 ROLE_NAMES = list(ROLES)
+
+
+def _role_has(role_name: str, capability: str) -> bool:
+    """Capability check by role name — usable before the active role is resolved
+    (e.g. inside the role-agnostic Ask Lane, which still reads st.session_state)."""
+    return capability in ROLES.get(role_name, {}).get("caps", set())
 # Architecture: retrieval is primary. During the temporary speed-first phase,
 # CLS_RETRIEVAL_ONLY disables every LLM augmentation path and CLS_KEYWORD_ONLY skips
 # semantic query embedding for deterministic keyword retrieval.
@@ -109,6 +122,8 @@ st.set_page_config(
     page_icon="🔬",
     layout="wide",
 )
+
+
 
 def render_evidence_store(rows: list[dict]) -> None:
     """Idle-state panel: visualize what is indexed, one bar per document."""
@@ -437,6 +452,11 @@ _BRIGHT_LANE_CSS = """
     --faint:  #a89fa8;
     --line:   #e8e4de;
     --accent: #ff8a3d;
+    --magenta:      #c2185b;
+    --magenta-ink:  #ad1457;
+    --magenta-line: #f3aac8;
+    --magenta-soft: #fde7f0;
+    --magenta-hot:  #fbd0e3;
 }
 html, body, #root { background: var(--bg) !important; }
 .stApp,
@@ -458,6 +478,70 @@ section[data-testid="stSidebar"] {
     border-right: 3px solid var(--accent) !important;
 }
 section[data-testid="stSidebar"] * { color: var(--ink) !important; }
+
+/* Research Scope multiselect — magenta lane. Force the BaseWeb control stack onto
+   light surfaces with a magenta accent so the scope picker reads as its own lane. */
+section[data-testid="stSidebar"] div[data-baseweb="select"] > div,
+section[data-testid="stSidebar"] div[data-baseweb="base-input"] {
+    background: var(--panel) !important;
+    border-color: var(--magenta-line) !important;
+    box-shadow: none !important;
+}
+section[data-testid="stSidebar"] div[data-baseweb="select"] > div {
+    border-radius: 12px !important;
+}
+section[data-testid="stSidebar"] div[data-baseweb="select"] > div:focus-within {
+    border-color: var(--magenta) !important;
+    box-shadow: 0 0 0 2px rgba(194,24,91,0.18) !important;
+}
+section[data-testid="stSidebar"] div[data-baseweb="select"] input {
+    background: transparent !important;
+    color: var(--ink) !important;
+    caret-color: var(--magenta) !important;
+}
+section[data-testid="stSidebar"] div[data-baseweb="select"] input::placeholder {
+    color: var(--faint) !important;
+}
+/* Selected scope pills */
+section[data-testid="stSidebar"] div[data-baseweb="tag"] {
+    background: var(--magenta-soft) !important;
+    color: var(--magenta-ink) !important;
+    border: 1px solid var(--magenta-line) !important;
+    border-radius: 999px !important;
+}
+section[data-testid="stSidebar"] div[data-baseweb="tag"] span,
+section[data-testid="stSidebar"] div[data-baseweb="tag"] svg {
+    color: var(--magenta) !important;
+    fill: currentColor !important;
+}
+
+/* The options menu is portalled outside the sidebar DOM. Target several BaseWeb
+   DOM shapes so the popup is a light magenta surface (this is the panel that was
+   rendering dark), not just the inner listbox. */
+div[data-baseweb="popover"] div[data-baseweb="menu"],
+div[data-baseweb="popover"] ul[role="listbox"],
+ul[role="listbox"],
+div[role="listbox"] {
+    background: var(--panel) !important;
+    border: 1px solid var(--magenta-line) !important;
+    border-radius: 12px !important;
+    box-shadow: 0 10px 26px rgba(173,20,87,0.18) !important;
+}
+li[role="option"],
+div[role="option"] {
+    background: transparent !important;
+    color: var(--ink) !important;
+}
+li[role="option"][aria-selected="true"],
+div[role="option"][aria-selected="true"] {
+    background: var(--magenta-soft) !important;
+    color: var(--magenta) !important;
+}
+li[role="option"]:hover,
+div[role="option"]:hover {
+    background: var(--magenta-hot) !important;
+    color: var(--magenta-ink) !important;
+}
 
 /* Hero header */
 .lane-hero { text-align:center; padding: 1.6rem 1rem 0.4rem; }
@@ -487,16 +571,99 @@ div[data-testid="stChatMessage"] * { color: var(--ink) !important; }
     white-space: nowrap;
 }
 
-/* Bottom chat input — rounded send-arrow bar */
-div[data-testid="stChatInput"] {
-    background: var(--panel) !important;
-    border: 1px solid var(--line) !important;
-    border-radius: 14px !important;
-    box-shadow: 0 6px 22px rgba(120,80,60,0.10);
+/* Grounded evidence bullets — escaped text rendered at a normal, fixed size so
+   stray markdown in the source (a leading "# ", pipes, asterisks) can never blow
+   the type up into a heading. */
+.lane-evidence { margin: 0.2rem 0 0.4rem 1.15rem; padding: 0; }
+.lane-evidence li {
+    color: var(--ink) !important;
+    font-size: 0.95rem !important;
+    font-weight: 400 !important;
+    line-height: 1.5;
+    margin: 0 0 0.4rem;
 }
-div[data-testid="stChatInput"] textarea { color: var(--ink) !important; }
-div[data-testid="stChatInput"] textarea::placeholder { color: var(--faint) !important; }
-div[data-testid="stBottomBlockContainer"] { background: transparent !important; }
+
+/* Bottom chat input — rounded send-arrow bar, light blue */
+div[data-testid="stChatInput"] {
+    background: #eaf4fb !important;
+    border: 1px solid #bfe0f3 !important;
+    border-radius: 14px !important;
+    box-shadow: 0 6px 22px rgba(80,140,180,0.14);
+}
+div[data-testid="stChatInput"] > div {
+    background: #eaf4fb !important;
+    border-radius: 14px !important;
+}
+div[data-testid="stChatInput"] [data-baseweb="textarea"],
+div[data-testid="stChatInput"] [data-baseweb="base-input"] {
+    background: #eaf4fb !important;
+    border: 0 !important;
+    box-shadow: none !important;
+}
+div[data-testid="stChatInput"] textarea {
+    background: #eaf4fb !important;
+    color: var(--ink) !important;
+    caret-color: var(--ink) !important;
+    box-shadow: none !important;
+}
+div[data-testid="stChatInput"] textarea::placeholder { color: #7fa8c4 !important; }
+div[data-testid="stChatInputSubmitButton"],
+div[data-testid="stChatInput"] button {
+    background: #d6ecf7 !important;
+    color: #2f7fb0 !important;
+    border: 1px solid #bfe0f3 !important;
+    border-radius: 10px !important;
+    box-shadow: none !important;
+}
+button[data-testid="stChatInputSubmitButton"] svg,
+div[data-testid="stChatInput"] button svg {
+    color: #2f7fb0 !important;
+    fill: currentColor !important;
+}
+button[data-testid="stChatInputSubmitButton"]:disabled,
+div[data-testid="stChatInput"] button:disabled {
+    background: #eaf4fb !important;
+    color: #9bb8cc !important;
+    border-color: #bfe0f3 !important;
+    opacity: 1 !important;
+}
+button[data-testid="stChatInputSubmitButton"]:disabled svg,
+div[data-testid="stChatInput"] button:disabled svg {
+    color: #9bb8cc !important;
+}
+div[data-testid="stChatInput"] button:hover {
+    border-color: #2f7fb0 !important;
+    background: #c8e4f4 !important;
+}
+/* Main scroll column — give it enough bottom padding so the last message can
+   scroll fully above the fixed input bar, not behind it. */
+section[data-testid="stMain"] .block-container,
+div[data-testid="stMainBlockContainer"] {
+    padding-bottom: 120px !important;
+}
+
+/* Fixed bottom bar — opaque on every layer. Do NOT override position/left/right:
+   Streamlit already places stBottom correctly relative to the sidebar. Overriding
+   left:0 makes the bar bleed behind the sidebar panel. Just lift z-index and set
+   backgrounds so it masks the message list above it. */
+div[data-testid="stBottom"] {
+    background: var(--bg) !important;
+    border-top: 1px solid var(--line) !important;
+    z-index: 100 !important;
+}
+div[data-testid="stBottom"] > div,
+div[data-testid="stBottomBlockContainer"] {
+    background: var(--bg) !important;
+}
+
+/* Hide Streamlit's native sidebar collapse/expand toggle (the << >> chevron).
+   This app uses the custom floating ← Back dock for navigation, so the native
+   toggle is redundant and clutters the top-left corner near the input area. */
+button[data-testid="stSidebarCollapsedControl"],
+button[data-testid="stBaseButton-headerNoPadding"],
+section[data-testid="stSidebarCollapsedControl"] {
+    display: none !important;
+}
 
 /* Buttons */
 .stButton > button,
@@ -546,6 +713,23 @@ def _fallback_tier(result: dict) -> str:
     return "weak" if top_score >= _WEAK_SCORE_THRESHOLD else "general"
 
 
+def _evidence_bullets_html(sentences: list[str]) -> str:
+    """Render grounded extractive sentences as an escaped HTML list.
+
+    Raw PDF evidence can begin with markdown block syntax — e.g. a literal "# "
+    section marker carried over from the source — which st.markdown parses as a
+    heading *inside* the list item ("- # foo"), blowing the font up to H1 size.
+    html.escape neutralises all markdown/HTML so the evidence renders verbatim at
+    a normal size. Returns "" when nothing is left after stripping.
+    """
+    items = "".join(
+        f"<li>{html.escape(clean)}</li>"
+        for sentence in sentences
+        if (clean := sentence.split(" [Source:")[0].strip())
+    )
+    return f'<ul class="lane-evidence">{items}</ul>' if items else ""
+
+
 def _render_turn(message: dict, dllm_online: bool) -> None:
     """Render one stored chat turn: user question + assistant answer with chips."""
     with st.chat_message("user", avatar="🧑‍🔬"):
@@ -562,9 +746,8 @@ def _render_turn(message: dict, dllm_online: bool) -> None:
         answer = message.get("answer", [])
         if answer:
             # Pass 1 — grounded extractive bullets. Provenance lives in the chips above.
-            for sentence in answer:
-                clean = sentence.split(" [Source:")[0].strip()
-                st.markdown(f"- {clean}")
+            # Escaped HTML, not markdown: raw evidence may start with "# " etc.
+            st.markdown(_evidence_bullets_html(answer), unsafe_allow_html=True)
         # Pass 2 — stored LLM augmentation (present when DLLM was online and RAG couldn't fully answer).
         augmentation = message.get("augmentation")
         aug_label = message.get("augmentation_label", "💬 AI augmentation · grounded synthesis")
@@ -590,9 +773,7 @@ def _render_scope_summary(scope: str, result: dict | None, *, dllm_online: bool)
         if chips:
             st.markdown(chips, unsafe_allow_html=True)
         if result.get("answer"):
-            for sentence in result["answer"]:
-                clean = sentence.split(" [Source:")[0].strip()
-                st.markdown(f"- {clean}")
+            st.markdown(_evidence_bullets_html(result["answer"]), unsafe_allow_html=True)
         else:
             tier = _fallback_tier(result)
             if tier == "weak":
@@ -621,12 +802,16 @@ def _render_ask_lane() -> None:
     )
 
     with st.sidebar:
+        if st.button("🔬 Home", use_container_width=True, key="ask_lane_home_btn"):
+            st.session_state.pop("ui_mode", None)
+            st.rerun()
+        st.divider()
         st.header("Research Scope")
         st.caption("Filter retrieval to one or more CLS beamlines.")
         selected_scopes = st.multiselect(
             "Active scopes",
             list(RESEARCH_SCOPES.keys()),
-            default=["All beamlines"],
+            default=[],
             key="lane_scopes",
             label_visibility="collapsed",
         )
@@ -650,9 +835,6 @@ def _render_ask_lane() -> None:
         st.divider()
         if st.button("🧹 Clear chat", use_container_width=True):
             st.session_state["lane_messages"] = []
-            st.rerun()
-        if st.button("← Home", use_container_width=True):
-            st.session_state.clear()
             st.rerun()
 
     messages: list[dict] = st.session_state.setdefault("lane_messages", [])
@@ -698,9 +880,7 @@ def _render_ask_lane() -> None:
                         st.markdown(chips, unsafe_allow_html=True)
 
                     if result["answer"]:
-                        for sentence in result["answer"]:
-                            clean = sentence.split(" [Source:")[0].strip()
-                            st.markdown(f"- {clean}")
+                        st.markdown(_evidence_bullets_html(result["answer"]), unsafe_allow_html=True)
 
                     # ---------------------------------------------------------------- #
                     # Pass 2 — streaming LLM fallback, tier-gated.                    #
@@ -750,7 +930,6 @@ def _render_ask_lane() -> None:
                 messages.append(turn)
                 st.session_state["lane_rows"] = result["rows"]
                 st.session_state["lane_from_cache"] = result["from_cache"]
-                st.session_state["hud_turns"] = st.session_state.get("hud_turns", 0) + 1
                 st.rerun()
         else:
             # ---------------------------------------------------------------- #
@@ -786,35 +965,7 @@ def _render_ask_lane() -> None:
                 st.session_state["lane_from_cache"] = any(
                     r.get("from_cache") for r in scope_results.values() if r
                 )
-                st.session_state["hud_turns"] = st.session_state.get("hud_turns", 0) + 1
                 st.rerun()
-
-    _render_hud()
-
-
-def _render_hud() -> None:
-    """Fixed floating prototype HUD — session telemetry for the dev."""
-    turns = st.session_state.get("hud_turns", 0)
-    is_lane = st.session_state.get("ui_mode") == "ask_lane"
-    rows = st.session_state.get("lane_rows" if is_lane else "last_rows", [])
-    top_score = f'{rows[0]["score"]:.3f}' if rows else "—"
-    from_cache = st.session_state.get("lane_from_cache" if is_lane else "last_from_cache")
-    cache_html = (
-        '<span style="color:#6fd58a;font-weight:700">HIT</span>'  if from_cache is True
-        else '<span style="color:#ff8a3d;font-weight:700">MISS</span>' if from_cache is False
-        else '<span style="color:#555;font-weight:700">—</span>'
-    )
-    ui_label = "Ask Lane" if st.session_state.get("ui_mode") == "ask_lane" else "Full App"
-    st.markdown(
-        f'<div class="cls-hud">'
-        f'<span class="cls-hud-title">&#x2B21; proto HUD</span>'
-        f'<div class="cls-hud-row"><span class="cls-hud-k">ui</span><span class="cls-hud-v">{ui_label}</span></div>'
-        f'<div class="cls-hud-row"><span class="cls-hud-k">turn</span><span class="cls-hud-v">#{turns}</span></div>'
-        f'<div class="cls-hud-row"><span class="cls-hud-k">score</span><span class="cls-hud-v">{top_score}</span></div>'
-        f'<div class="cls-hud-row"><span class="cls-hud-k">cache</span>{cache_html}</div>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
 
 
 def _home_gate() -> None:
@@ -1116,26 +1267,46 @@ st.markdown(
         word-break: break-word !important;
       }
 
-      /* Prototype HUD — fixed floating telemetry overlay */
-      .cls-hud {
-        position: fixed; bottom: 1.1rem; right: 1.1rem; z-index: 9999;
-        background: rgba(10,10,16,0.92);
-        border: 1px solid rgba(255,138,61,0.30);
-        border-radius: 12px; padding: 0.6rem 0.9rem 0.55rem;
-        font-size: 0.73rem; color: #b0a8b0;
-        backdrop-filter: blur(14px);
-        min-width: 150px; line-height: 1.55;
-        font-family: ui-monospace, 'Cascadia Code', monospace;
-        box-shadow: 0 6px 28px rgba(0,0,0,0.40);
-      }
-      .cls-hud-title {
-        font-weight: 800; color: #ff8a3d; font-size: 0.65rem;
-        letter-spacing: 0.10em; text-transform: uppercase;
-        margin-bottom: 0.38rem; display: block;
-      }
-      .cls-hud-row { display: flex; justify-content: space-between; gap: 0.8rem; padding: 0.03rem 0; }
-      .cls-hud-k   { color: #605860; }
-      .cls-hud-v   { color: #fff; font-weight: 600; }
+            /* Floating back dock — minimal cross-mode control, independent of role/UI HUD state. */
+            .cls-backdock {
+                position: fixed; right: 1.1rem; bottom: 1.1rem; z-index: 9999;
+                display: flex; align-items: center; gap: 0.45rem;
+                padding: 0.3rem; border-radius: 999px;
+                background: rgba(255,255,255,0.94);
+                border: 1px solid var(--line);
+                backdrop-filter: blur(10px);
+                box-shadow: 0 10px 28px rgba(120,80,60,0.14);
+                user-select: none;
+            }
+            .cls-backgrip {
+                display: inline-flex; align-items: center; justify-content: center;
+                width: 1.55rem; height: 1.55rem;
+                border-radius: 999px;
+                background: #f4f1ec;
+                border: 1px solid var(--line);
+                color: var(--faint);
+                cursor: grab;
+                font-size: 0.8rem; line-height: 1;
+            }
+            .cls-backgrip:active {
+                cursor: grabbing;
+                background: #efe8df;
+            }
+            .cls-backbtn {
+                display: inline-flex; align-items: center; justify-content: center;
+                min-height: 1.55rem; padding: 0 0.8rem;
+                border-radius: 999px;
+                background: var(--panel);
+                border: 1px solid var(--line);
+                color: var(--ink) !important;
+                font-size: 0.86rem; font-weight: 600;
+                text-decoration: none !important;
+            }
+            .cls-backbtn:hover {
+                background: #fff8f2;
+                border-color: var(--accent);
+                color: var(--accent) !important;
+            }
     </style>
     """,
     unsafe_allow_html=True,
@@ -1196,6 +1367,47 @@ def _human_size(num_bytes: int) -> str:
             return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024
     return f"{size:.1f} GB"
+
+
+def _render_db_status_badge() -> None:
+    """Colour-coded DB health indicator shown at the top of the Workspace expander.
+
+    Three states:
+      Green  — both collections healthy, no write lock held by any process.
+      Amber  — an exclusive write lock is held (reset/flush in progress elsewhere).
+      Red    — ChromaDB collections unreachable (corrupt store or mid-reset crash).
+
+    Both the Full App and the Ask Lane (separate OS processes) write to the same
+    on-disk ChromaDB files.  The amber state is the visual signal that a cross-
+    process admin operation is running and queries may block momentarily.
+    """
+    status = store_status()
+    if not status["healthy"]:
+        colour  = HUE_RED
+        icon    = "◉"
+        label   = "DB Error"
+        detail  = "ChromaDB collections unreachable — a full reset may be needed."
+    elif status["write_locked"]:
+        colour  = HUE_AMBER
+        icon    = "◉"
+        label   = "Write Locked"
+        detail  = "Admin operation in progress (another process holds the write guard)."
+    else:
+        colour  = HUE_GREEN
+        icon    = "◉"
+        label   = "Healthy"
+        detail  = (
+            f"{status['evidence_count']} evidence chunks · "
+            f"{status['cache_count']} cached queries"
+        )
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">'
+        f'<span style="color:{colour};font-size:1.15em;line-height:1">{icon}</span>'
+        f'<span style="font-weight:600;font-size:0.9em">{label}</span>'
+        f'<span style="color:#888;font-size:0.82em">{detail}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def _render_corpus_admin() -> None:
@@ -1339,6 +1551,10 @@ synth_enabled = False if RETRIEVAL_ONLY else dllm_api_online
 answer_mode = "Grounded"
 
 with st.sidebar:
+    if st.button("🔬 Home", use_container_width=True, key="full_app_home_btn"):
+        st.session_state.pop("ui_mode", None)
+        st.rerun()
+    st.divider()
     st.header("Active path")
     st.radio(
         "Role",
@@ -1358,11 +1574,36 @@ with st.sidebar:
     st.caption("Filter retrieval to a specific CLS beamline.")
     selected_scope = st.selectbox("Active scope", list(RESEARCH_SCOPES.keys()), label_visibility="collapsed")
     active_mfilter = RESEARCH_SCOPES[selected_scope]
-
-    st.divider()
-    if st.button("← Home", use_container_width=True):
-        st.session_state.clear()
-        st.rerun()
+    if role_can("scopes"):
+        scope_flash = st.session_state.pop("scope_flash", None)
+        if scope_flash:
+            st.success(scope_flash)
+        with st.expander("➕ Add research scope", expanded=False):
+            st.caption(
+                "Admin — saved permanently and shown to everyone. "
+                "Ingest docs under data/corpus/<slug>/ to populate it."
+            )
+            new_name = st.text_input(
+                "Scope name",
+                key="new_scope_name",
+                placeholder="e.g. SXRMB — Soft X-ray Microcharacterization",
+            )
+            new_domain = st.text_input(
+                "Domain slug (optional — derived from name if blank)",
+                key="new_scope_domain",
+                placeholder="e.g. sxrmb",
+            )
+            if st.button("Add scope", use_container_width=True, key="add_scope_btn"):
+                try:
+                    added_name, added_filter = add_research_scope(new_name, new_domain)
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    st.session_state["scope_flash"] = (
+                        f"Added \"{added_name}\" → corpus slug "
+                        f"data/corpus/{added_filter['domain']}/"
+                    )
+                    st.rerun()
 
 with st.expander("Search controls", expanded=False):
     st.caption("Tune retrieval and cache behavior without crowding the ask/search workspace.")
@@ -1391,6 +1632,7 @@ get_cache().distance_max = 1.0 - min_similarity
 
 if role_can("index") or active_role != "User" or role_can("dllm"):
     with st.expander("Workspace", expanded=False):
+        _render_db_status_badge()
         if role_can("index"):
             _render_corpus_admin()
             st.divider()
@@ -1403,9 +1645,13 @@ if role_can("index") or active_role != "User" or role_can("dllm"):
             st.metric("Indexed chunks", collection_count(get_collection()))
             if store_rows:
                 st.caption(f"across {len(store_rows)} document(s)")
-            if role_can("reset") and st.button("Reset Chroma index", use_container_width=True):
+            col_reset, col_flush = st.columns(2)
+            if role_can("reset") and col_reset.button("Reset Chroma index", use_container_width=True):
                 reset_collection()
                 st.success("Evidence Store reset (CAG cache cleared too). Re-index to query again.")
+            if role_can("reset") and col_flush.button("Flush CAG cache", use_container_width=True):
+                n = flush_cag_cache()
+                st.success(f"CAG cache cleared ({n} entr{'y' if n == 1 else 'ies'} removed). Corpus untouched.")
 
         if role_can("dllm"):
             carrier_name = dllm_endpoint.get("carrier", "OpenRouter")
@@ -1531,7 +1777,6 @@ with left:
                     "text": None,
                     "strict": answer_mode == "Grounded",
                 }
-                st.session_state["hud_turns"] = st.session_state.get("hud_turns", 0) + 1
 
     if role_can("eval") and st.button("Run graded offline checks", use_container_width=True):
         if collection_count(get_collection()) == 0:
@@ -1555,8 +1800,6 @@ with right:
         )
     else:
         render_evidence_store(evidence_breakdown(get_collection()))
-
-_render_hud()
 
 eval_rows = st.session_state.get("eval_rows", [])
 if eval_rows:

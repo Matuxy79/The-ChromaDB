@@ -37,7 +37,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 from pathlib import Path
 from threading import RLock
 from typing import Any, Generator
@@ -89,6 +91,73 @@ from cls_backend.pipeline import (
 # Embed + write this many chunks at a time during ingest. Bounds peak memory so a single
 # large document can't OOM the process on small-RAM hosts.
 INGEST_BATCH_SIZE = 256
+
+# ---------------------------------------------------------------------------
+# Cross-process write coordination
+# ---------------------------------------------------------------------------
+# Streamlit (app.py) and Chainlit (chat_lane.py) run as separate OS processes
+# sharing the same on-disk ChromaDB files.  The RLock above only protects
+# threads *within* one process.  fcntl.flock() is an advisory lock backed by
+# the kernel that both processes see, so a Streamlit admin reset can't race
+# with an active Chainlit query and delete a collection mid-read.
+#
+# Only destructive admin operations (reset, flush) hold the exclusive lock.
+# Normal reads and cache upserts do NOT lock — ChromaDB's SQLite WAL handles
+# concurrent readers safely, and cache upserts use deterministic IDs (safe to
+# collide as idempotent upserts).
+_LOCK_FILE = CHROMA_DIR / ".write.lock"
+
+
+@contextmanager
+def chroma_write_guard():
+    """Exclusive cross-process advisory lock for admin write operations.
+
+    Acquired by reset_collection() and flush_cag_cache().  Any process that
+    tries to acquire it while another holds it will block (not error), so a
+    Chainlit query arriving during an admin reset waits a moment rather than
+    crashing into a deleted collection.
+    """
+    _LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(_LOCK_FILE, "w") as _lf:
+        fcntl.flock(_lf, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(_lf, fcntl.LOCK_UN)
+
+
+def store_status() -> dict:
+    """Live health summary for the Streamlit DB status badge.
+
+    Probes both ChromaDB collections for accessibility and checks whether an
+    exclusive write lock is currently held by another process (i.e. a reset or
+    flush is in progress in Streamlit or Chainlit).
+
+    Returns a dict with keys: healthy, write_locked, evidence_count, cache_count.
+    """
+    write_locked = False
+    try:
+        _LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(_LOCK_FILE, "w") as _lf:
+            fcntl.flock(_lf, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            fcntl.flock(_lf, fcntl.LOCK_UN)
+    except (BlockingIOError, OSError):
+        write_locked = True
+
+    try:
+        evidence_count = collection_count(get_collection())
+        cache_count = get_cache().count()
+        healthy = True
+    except Exception:
+        evidence_count = cache_count = 0
+        healthy = False
+
+    return {
+        "healthy": healthy,
+        "write_locked": write_locked,
+        "evidence_count": evidence_count,
+        "cache_count": cache_count,
+    }
 
 
 @dataclass(frozen=True)
@@ -338,18 +407,47 @@ def reset_collection() -> None:
     stale/old-version collections (e.g. earlier 768d/512d builds) can't pile up or shadow the
     active store. The next get_collection() recreates a clean, empty v2 collection to re-index.
     """
-    global _collection, _cache_collection, _cache
-    with _RESOURCE_LOCK:
-        client = get_chroma_client()
-        for collection in client.list_collections():
+    with chroma_write_guard():  # blocks any concurrent process until the reset is complete
+        global _collection, _cache_collection, _cache
+        with _RESOURCE_LOCK:
+            client = get_chroma_client()
+            for collection in client.list_collections():
+                try:
+                    client.delete_collection(collection.name)
+                except Exception:
+                    pass
+            _collection = None
+            _cache_collection = None
+            _cache = None
+            clear_lexical_index_cache()
+
+
+def flush_cag_cache() -> int:
+    """Drop and recreate *only* the CAG semantic cache collection, leaving the Evidence
+    Store (indexed corpus) completely untouched.
+
+    Use this to clear accumulated production noise from the query cache — stale entries,
+    mistaken queries, test runs — without forcing a full re-index.  Both the Full App
+    (app.py) and the Ask Lane (chat_lane.py) share this cache, so one flush covers both.
+
+    Returns the number of entries that were in the cache before it was cleared.
+    """
+    with chroma_write_guard():  # blocks any concurrent process for the duration
+        global _cache_collection, _cache
+        with _RESOURCE_LOCK:
+            client = get_chroma_client()
+            prior_count = 0
             try:
-                client.delete_collection(collection.name)
+                existing = client.get_collection(CACHE_COLLECTION_NAME)
+                prior_count = existing.count()
+                client.delete_collection(CACHE_COLLECTION_NAME)
             except Exception:
                 pass
-        _collection = None
-        _cache_collection = None
-        _cache = None
-        clear_lexical_index_cache()
+            _cache_collection = None
+            _cache = None
+            # Recreate immediately so the next query can write to a fresh collection.
+            get_cache()
+            return prior_count
 
 
 def warm_keyword_index() -> int:

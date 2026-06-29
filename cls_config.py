@@ -28,7 +28,9 @@ corresponding sub-folder under ``data/corpus/``.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 from pathlib import Path
 
 
@@ -81,6 +83,85 @@ RESEARCH_SCOPES = {
     "VESPERS":                                      {"domain": "vespers"},
     "VLS-PGM — Variable Line Spacing PGM":          {"domain": "vls_pgm"},
 }
+
+# Admin-added scopes are layered on top of the built-ins above and persisted here
+# so they survive restarts and are shared by every session/frontend. The built-in
+# names stay the source of truth in code; only runtime additions go to disk.
+CUSTOM_SCOPES_PATH = APP_ROOT / "data" / "custom_scopes.json"
+_BUILTIN_SCOPE_NAMES = frozenset(RESEARCH_SCOPES)
+
+
+def _slugify_domain(value: str) -> str:
+    """Normalise free text into a corpus folder slug (lowercase, a-z0-9 and _)."""
+    return re.sub(r"[^a-z0-9]+", "_", (value or "").strip().lower()).strip("_")
+
+
+def _load_custom_scopes() -> dict[str, dict | None]:
+    """Read admin-added scopes from disk; tolerate a missing or corrupt file."""
+    if not CUSTOM_SCOPES_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(CUSTOM_SCOPES_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        name.strip(): mfilter
+        for name, mfilter in raw.items()
+        if isinstance(name, str) and name.strip()
+    }
+
+
+def _persist_custom_scopes() -> None:
+    """Write every non-built-in scope back to CUSTOM_SCOPES_PATH as JSON."""
+    custom = {
+        name: mfilter
+        for name, mfilter in RESEARCH_SCOPES.items()
+        if name not in _BUILTIN_SCOPE_NAMES
+    }
+    CUSTOM_SCOPES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CUSTOM_SCOPES_PATH.write_text(
+        json.dumps(custom, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def add_research_scope(name: str, domain: str = "") -> tuple[str, dict]:
+    """Register a new beamline lane and persist it so it survives restarts.
+
+    Mutates RESEARCH_SCOPES in place so any frontend holding a reference to the
+    dict picks the new lane up on its next rerun, then saves the custom subset to
+    disk. ``domain`` defaults to a slug derived from ``name``. The slug doubles as
+    the folder name under ``data/corpus/`` that ingest reads, so a new lane stays
+    empty until documents are ingested under that slug.
+
+    Returns ``(display_name, metadata_filter)``. Raises ``ValueError`` on empty or
+    duplicate input.
+    """
+    name = (name or "").strip()
+    slug = _slugify_domain(domain or name)
+    if not name:
+        raise ValueError("Scope name cannot be empty.")
+    if not slug:
+        raise ValueError("Domain slug must contain at least one letter or digit.")
+    if name in RESEARCH_SCOPES:
+        raise ValueError(f"A scope named “{name}” already exists.")
+    existing_slugs = {
+        f["domain"] for f in RESEARCH_SCOPES.values()
+        if isinstance(f, dict) and "domain" in f
+    }
+    if slug in existing_slugs:
+        raise ValueError(f"The domain “{slug}” is already used by another scope.")
+    mfilter = {"domain": slug}
+    RESEARCH_SCOPES[name] = mfilter
+    _persist_custom_scopes()
+    return name, mfilter
+
+
+# Layer any previously saved admin scopes on top of the built-ins, in place, so
+# existing references to RESEARCH_SCOPES stay valid.
+for _scope_name, _scope_filter in _load_custom_scopes().items():
+    RESEARCH_SCOPES.setdefault(_scope_name, _scope_filter)
 
 DEFAULT_API_URL = os.getenv("CLS_API_URL", "http://127.0.0.1:8010")
 
