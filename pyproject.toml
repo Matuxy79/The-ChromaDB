@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools>=72", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+# ---------------------------------------------------------------------------
+# Project metadata
+# ---------------------------------------------------------------------------
+[project]
+name            = "cls-rag-cag"
+version         = "1.2.0"
+description     = "RAG+CAG information-retrieval chatbot for the Canadian Light Source synchrotron — beamline-scoped, corpus-ephemeral, built from the ground up on Streamlit + ChromaDB."
+readme          = "README.md"
+license         = { text = "MIT" }
+requires-python = ">=3.10"
+
+authors = [
+    { name = "John Matukutiree", email = "matukuj@lightsource.ca" },
+]
+
+keywords = [
+    "RAG",
+    "CAG",
+    "ChromaDB",
+    "Canadian Light Source",
+    "synchrotron",
+    "retrieval-augmented generation",
+    "streamlit",
+    "fastapi",
+    "sentence-transformers",
+    "beamline",
+]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+# Runtime dependencies — mirrors requirements.txt exactly.
+# The data/corpus/ tree is intentionally ephemeral: the custom launcher
+# (scripts/launch_cls.sh) and ingest_daemon.py manage corpus population
+# at runtime; nothing under data/ is packaged or installed.
+dependencies = [
+    "streamlit",
+    "chainlit",
+    "fastapi",
+    "uvicorn[standard]",
+    "chromadb",
+    "pandas",
+    "pymupdf",
+    "python-docx",
+    "sentence-transformers",
+]
+
+[project.urls]
+"Personal GitHub"       = "https://github.com/Matuxy79/The-ChromaDB"
+"CLS Repository"        = "https://github.lightsource.ca/matukuj/AI-Lightsource-student-summer"
+"Bug Tracker"           = "https://github.com/Matuxy79/The-ChromaDB/issues"
+
+# ---------------------------------------------------------------------------
+# Package discovery — only cls_backend/ is a real importable package;
+# everything else (app.py, api.py, …) is top-level application scripts.
+# ---------------------------------------------------------------------------
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["cls_backend*"]
+
+# ---------------------------------------------------------------------------
+# Test configuration
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths   = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts     = "-v --tb=short"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-cov",
+]
