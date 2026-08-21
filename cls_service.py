@@ -77,6 +77,7 @@ from cls_backend.dllm import (
 from cls_backend.pipeline import (
     EMBED_DIM,
     VECTOR_STORE_RECOVERY_MESSAGE,
+    EmbeddingUnavailableError,
     SentenceTransformerEmbedder,
     clear_lexical_index_cache,
     collection_count,
@@ -390,6 +391,11 @@ def ingest_path(
                 metadatas=[chunk.metadata for chunk in batch],
                 embeddings=active_embedder.embed(chunk.text for chunk in batch),
             )
+    except EmbeddingUnavailableError:
+        # Encoder offline — not store corruption. Propagate as-is so callers
+        # (ingest daemon, admin panel) keep existing chunks and report the
+        # true cause instead of a misleading "reset the index" message.
+        raise
     except Exception as exc:
         raise RuntimeError(VECTOR_STORE_RECOVERY_MESSAGE) from exc
     stale_ids = list(set(existing_ids) - set(chunk_ids))
