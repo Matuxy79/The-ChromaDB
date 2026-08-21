@@ -28,6 +28,7 @@ Start standalone:  ./scripts/launch_api.sh
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from typing import Any, Literal
@@ -47,9 +48,18 @@ app = FastAPI(
     version=APP_VERSION,
     description="Shared RAG API plus inference carrier proxy for Streamlit, Chainlit, and OpenAI-compatible frontends.",
 )
+# CORS: local frontends always allowed; when deployed (Railway injects
+# RAILWAY_PUBLIC_DOMAIN / the service URL), the platform's own origin and any
+# https origin listed in CLS_CORS_ORIGINS are added so browser clients on the
+# public domain are not blocked.
+_EXTRA_ORIGINS = [o.strip() for o in os.getenv("CLS_CORS_ORIGINS", "").split(",") if o.strip()]
+_RAILWAY_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "") or os.getenv("RAILWAY_DOMAIN", "")
+if _RAILWAY_DOMAIN:
+    _EXTRA_ORIGINS.append(f"https://{_RAILWAY_DOMAIN}")
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_origins=_EXTRA_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],

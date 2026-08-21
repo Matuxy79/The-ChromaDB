@@ -1,0 +1,16 @@
+# Railway deployment configuration for the CLS RAG+CAG API.
+#
+# The ASGI application object lives in api.py and is re-exported by main.py so
+# the platform's default `uvicorn main:app` contract resolves. Nixpacks detects
+# requirements.txt automatically and installs the Python dependencies at build
+# time; the start command below binds uvicorn to the port Railway injects.
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
+healthcheckPath = "/health"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
